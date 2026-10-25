@@ -16,9 +16,11 @@ jobs:
     name: Dogfood the action on the fixture
     runs-on: ubuntu-latest
     permissions:
+      # Resolving the review threads of copies that are gone needs contents: write.
+      contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -43,6 +45,26 @@ jobs:
           status="$(cat "$RUNNER_TEMP/echoes-post-status" 2>/dev/null || echo missing)"
           body="$RUNNER_TEMP/echoes-review.md"
           repo="$GITHUB_REPOSITORY"
+          # The scheduled check reverts its copies in a second commit, whose run must resolve
+          # the threads of the first and dismiss its request for changes.
+          if [ -n "$EXPECTED_ROWS" ] && ! gh api "repos/$repo/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' \
+            | grep -qx 'tests/fixtures/apicheck/src/lib.rs'; then
+            case "$status" in
+              skipped-*) ;;
+              *) echo "the reverted check branch adds no copy, so nothing must post, got $status"; exit 1 ;;
+            esac
+            # The action's own thread listing, so the check reads threads the way the action does.
+            # shellcheck source=scripts/lib.sh
+            . scripts/lib.sh
+            open_threads="$(list_threads "$repo" "$PR_NUMBER" \
+              | jq -s '[.[] | select(.comments.nodes[0].author.login == "github-actions" and (.isResolved | not))] | length')"
+            [ "$open_threads" = "0" ] || { echo "$open_threads echoes threads stay open after their copies were removed"; exit 1; }
+            requests="$(gh api "repos/$repo/pulls/$PR_NUMBER/reviews" --paginate \
+              --jq '.[] | select(.user.login == "github-actions[bot]" and .state == "CHANGES_REQUESTED") | .id' | wc -l)"
+            [ "$requests" -eq 0 ] || { echo "$requests echoes requests for changes stay after their copies were removed"; exit 1; }
+            echo "the reverted check branch resolved every echoes thread and dismissed every request for changes"
+            exit 0
+          fi
           if [ -n "$EXPECTED_ROWS" ] && [ "$status" != "posted" ]; then
             echo "the check branch adds new copies, so the review must post, got $status"
             exit 1
@@ -128,7 +150,7 @@ jobs:
     if: ${{ github.event_name == 'pull_request' }}
     permissions: {}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -182,7 +204,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -205,8 +227,8 @@ jobs:
           body="$RUNNER_TEMP/echoes-review.md"
           removable=0
           declare -A shared=()
-          while IFS=$'\x1f' read -r p line _ _ c _ _ _ _ _ end _ _ kind remedy _ _ _ public; do
-            [ "$c" != "1" ] || continue
+          # One row per copy the review comments on, kept copies are already left out.
+          while IFS=$'\x1f' read -r p line end kind remedy public; do
             [ "$kind" = "function" ] || { echo "$p:$line is a $kind, the fixture holds functions only"; exit 1; }
             [ "$remedy" = "delete" ] && [ "$public" = "1" ] && remedy=public
             if [ "$remedy" != "delete" ]; then
@@ -222,7 +244,8 @@ jobs:
             esac
             [ "$last" = "}" ] || { echo "the suggestion on $p:$line-$end does not end on the closing brace: $last"; exit 1; }
             echo "verified $p:$line-$end deletes exactly one function"
-          done < "$RUNNER_TEMP/echoes-inline.tsv"
+          done < <(jq -r '[.path, .line, (.end // ""), .kind, (.remedy // ""), (if .s.public then 1 else 0 end)]
+            | map(tostring) | join("\u001f")' "$RUNNER_TEMP/echoes-rows.ndjson")
           [ "$removable" = "3" ] || { echo "expected 3 removable copies, got $removable"; exit 1; }
           [ "${shared[public]:-0}" = "2" ] || { echo "expected 2 public copies, got ${shared[public]:-0}"; exit 1; }
           for remedy in generic-or-macro helper-or-macro merge-cfg; do
@@ -236,7 +259,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master

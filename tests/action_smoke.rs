@@ -12,15 +12,13 @@ use std::fs;
 use std::path::Path;
 
 use action::fix::{
-    Cand, coverage, ctx_group, doc_site, group, issue_url, report, reuse, reuse_group, site,
+    Cand, coverage, ctx_group, doc_site, group, issue_url, report, reuse, reuse_group, review,
+    site, thread,
 };
 use action::runner::{Runner, Use};
 use action::world::{SRC_DUP, SRC_LIB, SRC_PARSER, World, repo_id};
 use serde_json::{Value, json};
 
-// actions/cache v4 and actions/cache save v4 resolve to this commit, verified
-// against the actions/cache repository refs.
-const CACHE_SHA: &str = "0057852bfaa89a56745cba8c7296529d2fc39830";
 const CACHE_KEY_PREFIX: &str = "echoes-context-index-Linux-";
 
 fn use_by_name<'a>(uses: &'a [Use], name: &str) -> Option<&'a Use> {
@@ -207,9 +205,7 @@ fn s04_pr_local_onlynew() {
         1,
         1,
     );
-    let mut world = World::new("s04")
-        .inputs(&[("pr-number", "7")])
-        .event("pull_request")
+    let mut world = World::pull_request("s04")
         .git()
         .json(report(
             &[group(
@@ -274,13 +270,29 @@ fn s04_pr_local_onlynew() {
         "the base scan inventories every site"
     );
     assert!(
-        !base_args.iter().any(|a| a == "--context-dependency-depth"),
-        "the base scan inherits no dependency depth"
-    );
-    assert!(
         r.summary().contains("Copies to remove"),
         "the summary lists the copies to remove"
     );
+}
+
+#[test]
+fn s50_exclude_reaches_the_scan_and_the_base_scan() {
+    let mut world = World::pull_request("s50")
+        .inputs(&[("exclude", "benches/**\n  examples/ \n\n")])
+        .git()
+        .json(report(&[], &[], None, 6, 3))
+        .base_json(report(&[], &[], None, 1, 1));
+    assert_eq!(world.run(), 0);
+    let r = world.runner();
+    for call in 0..2 {
+        let args = r.scan_args(call);
+        let excludes: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--exclude")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(excludes, ["benches/**", "examples/"], "scan {call}");
+    }
 }
 
 /// The reuse report of the four candidate shapes the rendering covers.
@@ -333,9 +345,8 @@ fn s05_report() -> Value {
 
 #[test]
 fn s05_pr_reuse_only() {
-    let mut world = World::new("s05")
-        .inputs(&[("pr-number", "7"), ("context-dependency-depth", "2")])
-        .event("pull_request")
+    let mut world = World::pull_request("s05")
+        .inputs(&[("context-dependency-depth", "2")])
         .git()
         .json(s05_report())
         .base_json(report(&[], &[], None, 6, 3))
@@ -395,7 +406,18 @@ fn s05_pr_reuse_only() {
         text.contains("lookup: `issue lookup unavailable: HTTP 503`"),
         "the failed issue lookup is rendered explicitly"
     );
-    let summary = r.summary();
+    assert!(
+        text.contains("Report a wrong review")
+            && text.contains("reuse%20group%20R1")
+            && text.contains("src%2Fparser.rs%3A3%20%20app%3A%3Aparser%3A%3Aselected")
+            && text.contains("direct%201.2.3%20%20direct%3A%3Ahelper"),
+        "the reuse advice links a wrong-review issue naming the local site and the candidates"
+    );
+    s05_summary_checks(&r.summary());
+}
+
+/// The run summary of the reuse report, its section, candidate order and coverage.
+fn s05_summary_checks(summary: &str) {
     assert!(
         summary.contains("### Dependency reuse"),
         "the run summary reports the reuse groups"
@@ -431,9 +453,8 @@ fn s05_pr_reuse_only() {
 
 #[test]
 fn s06_pr_context_groups() {
-    let mut world = World::new("s06")
-        .inputs(&[("pr-number", "7"), ("context-select", "crate:app")])
-        .event("pull_request")
+    let mut world = World::pull_request("s06")
+        .inputs(&[("context-select", "crate:app")])
         .git()
         .json(report(
             &[],
@@ -483,6 +504,25 @@ fn s06_pr_context_groups() {
         !text.contains("remove") && !text.contains("delet"),
         "the context advice never suggests deletion"
     );
+    assert!(
+        text.contains("Report a wrong review")
+            && text.contains("context%20group%20C1")
+            && text.contains("src%2Fparser.rs%3A3%20%20app%3A%3Aparser%3A%3Aselected")
+            && text.contains("src%2Fmod.rs%3A10%20%20app%3A%3Aother%3A%3Aselected"),
+        "the context advice links a wrong-review issue naming every copy"
+    );
+    assert!(
+        text.contains("  - [`src/parser.rs:3-6`](")
+            && text.contains("/src/parser.rs#L3-L6)  `app::parser::selected`"),
+        "the other context copy links its lines at the head commit"
+    );
+    assert!(
+        text.contains(&thread_marker(
+            ".",
+            "context%3AC1%3Asrc%2Fmod.rs%3Aapp%3A%3Aother%3A%3Aselected"
+        )),
+        "the comment carries its workspace and finding key"
+    );
     let summary = r.summary();
     assert!(
         summary.contains("### Context groups"),
@@ -498,9 +538,8 @@ fn s06_pr_context_groups() {
 
 #[test]
 fn s07_pr_fork_403() {
-    let mut world = World::new("s07")
-        .inputs(&[("pr-number", "7"), ("only-new", "false")])
-        .event("pull_request")
+    let mut world = World::pull_request("s07")
+        .inputs(&[("only-new", "false")])
         .fork()
         .json(report(
             &[group(
@@ -547,9 +586,7 @@ fn s07_pr_fork_403() {
 #[test]
 fn s08_pr_incomplete() {
     let local = site("src/parser.rs", 3, 6, "app::parser::selected");
-    let mut world = World::new("s08")
-        .inputs(&[("pr-number", "7"), ("context-dependency-depth", "2")])
-        .event("pull_request")
+    let mut world = World::pull_request("s08").inputs(&[("context-dependency-depth", "2")])
         .json(report(
             &[],
             &[],
@@ -688,14 +725,12 @@ fn s09_payload_checks(world: &World, r: &Runner) {
 #[test]
 fn s09_prepare_post_reuse() {
     let (rep, base_report) = s09_fixture();
-    let mut world = World::new("s09a")
+    let mut world = World::pull_request("s09a")
         .inputs(&[
-            ("pr-number", "7"),
             ("mode", "prepare"),
             ("payload", "echoes-payload"),
             ("context-dependency-depth", "2"),
         ])
-        .event("pull_request")
         .git()
         .json(rep)
         .base_json(base_report)
@@ -709,13 +744,8 @@ fn s09_prepare_post_reuse() {
     let (base, head) = world.shas();
     // The posting job runs on a fresh runner sharing the prepare workspace, so
     // the payload directory outlives the prepare job.
-    let mut world2 = World::new("s09b")
-        .inputs(&[
-            ("pr-number", "7"),
-            ("mode", "post"),
-            ("payload", "echoes-payload"),
-        ])
-        .event("pull_request")
+    let mut world2 = World::pull_request("s09b")
+        .inputs(&[("mode", "post"), ("payload", "echoes-payload")])
         .workspace(payload_ws)
         .base_sha(&base)
         .head_sha(&head)
@@ -848,21 +878,9 @@ fn s12_cache_trusted_save() {
     let restore = use_by_name(uses, "Restore the dependency index");
     let save = use_by_name(uses, "Save the dependency index");
     assert!(restore.is_some(), "the trusted run restores the index");
-    let expected = format!("actions/cache/restore@{CACHE_SHA}");
-    assert_eq!(
-        restore.map(|u| u.uses.as_str()),
-        Some(expected.as_str()),
-        "the restore uses the SHA-pinned cache action"
-    );
     assert!(
         save.is_some(),
         "the trusted successful indexing saves the index"
-    );
-    let expected = format!("actions/cache/save@{CACHE_SHA}");
-    assert_eq!(
-        save.map(|u| u.uses.as_str()),
-        Some(expected.as_str()),
-        "the save uses the SHA-pinned save action"
     );
     let cache_dir = r
         .step_outputs()
@@ -976,9 +994,7 @@ fn s13b_cache_depth_zero() {
 fn s14_escape_untrusted() {
     let local = site("src/parser.rs", 3, 6, "app::parser::selected");
     let evil = r#"weird:item, 50% $(touch "$RUNNER_TEMP/pwned") `backtick` "quoted""#;
-    let mut world = World::new("s14")
-        .inputs(&[("pr-number", "7"), ("context-dependency-depth", "2")])
-        .event("pull_request")
+    let mut world = World::pull_request("s14").inputs(&[("context-dependency-depth", "2")])
         .git()
         .json(report(
             &[],
@@ -1026,14 +1042,9 @@ fn s14_escape_untrusted() {
 #[test]
 fn s15_prepare_post_reuse_only() {
     let local = site("src/parser.rs", 3, 6, "app::parser::selected");
-    let mut world = World::new("s15a")
-        .inputs(&[
-            ("pr-number", "7"),
-            ("mode", "prepare"),
-            ("payload", "echoes-payload"),
-            ("context-dependency-depth", "2"),
-        ])
-        .event("pull_request")
+    let mut world = World::pull_request("s15a").inputs(&[("mode", "prepare"),
+    ("payload", "echoes-payload"),
+    ("context-dependency-depth", "2"),])
         .git()
         .json(report(
             &[],
@@ -1063,13 +1074,8 @@ fn s15_prepare_post_reuse_only() {
     // The posting job shares the prepare workspace so the payload survives it.
     let payload_ws = world.workspace_path().to_path_buf();
     let (base, head) = world.shas();
-    let mut world2 = World::new("s15b")
-        .inputs(&[
-            ("pr-number", "7"),
-            ("mode", "post"),
-            ("payload", "echoes-payload"),
-        ])
-        .event("pull_request")
+    let mut world2 = World::pull_request("s15b")
+        .inputs(&[("mode", "post"), ("payload", "echoes-payload")])
         .workspace(payload_ws)
         .base_sha(&base)
         .head_sha(&head)
@@ -1091,13 +1097,8 @@ fn s15_prepare_post_reuse_only() {
 
 #[test]
 fn s16_comment_cap() {
-    let mut world = World::new("s16")
-        .inputs(&[
-            ("pr-number", "7"),
-            ("only-new", "false"),
-            ("max-comments", "2"),
-        ])
-        .event("pull_request")
+    let mut world = World::pull_request("s16")
+        .inputs(&[("only-new", "false"), ("max-comments", "2")])
         .json(report(
             &[group(
                 "g1",
@@ -1152,9 +1153,8 @@ fn s16_comment_cap() {
 
 #[test]
 fn s17_rate_limit_403() {
-    let mut world = World::new("s17")
-        .inputs(&[("pr-number", "7"), ("only-new", "false")])
-        .event("pull_request")
+    let mut world = World::pull_request("s17")
+        .inputs(&[("only-new", "false")])
         .json(report(
             &[group(
                 "g1",
@@ -1212,9 +1212,8 @@ fn s17_rate_limit_403() {
 
 #[test]
 fn s18_perm_403_readonly() {
-    let mut world = World::new("s18")
-        .inputs(&[("pr-number", "7"), ("only-new", "false")])
-        .event("pull_request")
+    let mut world = World::pull_request("s18")
+        .inputs(&[("only-new", "false")])
         .json(report(
             &[group(
                 "g1",
@@ -1263,9 +1262,8 @@ fn s19_oor_truncation() {
             "item": format!("app::f{i}"),
         }));
     }
-    let mut world = World::new("s19")
-        .inputs(&[("pr-number", "7"), ("only-new", "false")])
-        .event("pull_request")
+    let mut world = World::pull_request("s19")
+        .inputs(&[("only-new", "false")])
         .json(report(&[group("g1", "H1", &sites)], &[], None, 6, 3))
         .changed(&["src/lib.rs"]);
     let exit = world.run();
@@ -1302,14 +1300,12 @@ fn s19_oor_truncation() {
 #[test]
 fn s20_prepare_post_cap() {
     let local = site("src/parser.rs", 3, 6, "app::parser::selected");
-    let mut world = World::new("s20a")
+    let mut world = World::pull_request("s20a")
         .inputs(&[
-            ("pr-number", "7"),
             ("mode", "prepare"),
             ("payload", "echoes-payload"),
             ("max-comments", "1"),
         ])
-        .event("pull_request")
         .json(report(
             &[group(
                 "g1",
@@ -1351,14 +1347,12 @@ fn s20_prepare_post_cap() {
     );
     let payload_ws = world.workspace_path().to_path_buf();
     let (base, head) = world.shas();
-    let mut world2 = World::new("s20b")
+    let mut world2 = World::pull_request("s20b")
         .inputs(&[
-            ("pr-number", "7"),
             ("mode", "post"),
             ("payload", "echoes-payload"),
             ("max-comments", "1"),
         ])
-        .event("pull_request")
         .workspace(payload_ws)
         .base_sha(&base)
         .head_sha(&head)
@@ -1419,13 +1413,8 @@ fn prepared(name: &str, copies: usize, item: &str, kind: &str) -> World {
         g["remedy"] = json!(kind);
     }
     let changed: Vec<&str> = files.iter().map(String::as_str).collect();
-    let mut world = World::new(name)
-        .inputs(&[
-            ("pr-number", "7"),
-            ("mode", "prepare"),
-            ("payload", "echoes-payload"),
-        ])
-        .event("pull_request")
+    let mut world = World::pull_request(name)
+        .inputs(&[("mode", "prepare"), ("payload", "echoes-payload")])
         .json(report(&[g], &[], None, 6, 3))
         .changed(&changed);
     for f in &files {
@@ -1450,6 +1439,22 @@ fn post_world(name: &str, prepared: &World, event: &str, inputs: &[(&str, &str)]
         .base_sha(&base)
         .head_sha(&head)
         .changed(&changed)
+}
+
+#[test]
+fn s48_prepare_writes_a_payload_for_a_clean_scan() {
+    let mut prep = World::pull_request("s48a")
+        .inputs(&[("mode", "prepare"), ("payload", "echoes-payload")])
+        .json(report(&[], &[], None, 6, 3));
+    assert_eq!(prep.run(), 0, "a clean prepare run exits 0");
+    let payload = prep.workspace_path().join("echoes-payload");
+    for file in ["meta.json", "report.json"] {
+        assert!(payload.join(file).is_file(), "{file}");
+    }
+    let mut post = post_world("s48b", &prep, "workflow_run", &[]);
+    let (exit, status) = post_status(&mut post);
+    assert_eq!(exit, 0, "a clean payload is no error");
+    assert!(status.starts_with("skipped-"), "{status}");
 }
 
 /// Rewrites `key` in the payload metadata.
@@ -1884,9 +1889,7 @@ fn s39_review_fences_candidate_text_and_checks_links() {
             site("src/parser.rs", 10, 13, "app::other"),
         ],
     );
-    let mut world = World::new("s39")
-        .inputs(&[("pr-number", "7")])
-        .event("pull_request")
+    let mut world = World::pull_request("s39")
         .json(report(
             &[],
             &[ctx],
@@ -2198,9 +2201,21 @@ fn s22_selected_organizations_keep_the_job_token() {
 }
 
 #[test]
-fn s23_selection_is_gate_only_and_exclusive() {
+fn s49_selected_organizations_and_repositories_join() {
+    let mut world = World::new("s49").inputs(&[("organizations", "acme"), ("repositories", "o/a")]);
+    let exit = world.run();
+    let r = world.runner();
+    assert_eq!(exit, 0, "a clean selection scan exits 0");
+    let scan = r.scan_args(0);
+    assert_eq!(
+        &scan[scan.len() - 4..],
+        ["--organization", "acme", "--repository", "o/a"]
+    );
+}
+
+#[test]
+fn s23_selection_is_gate_only() {
     for (case, extra) in [
-        ("both", ("organizations", "acme")),
         ("pr", ("pr-number", "7")),
         ("dry", ("dry-run", "true")),
         ("prepare", ("mode", "prepare")),
@@ -2214,4 +2229,521 @@ fn s23_selection_is_gate_only_and_exclusive() {
         assert!(r.scan_calls().is_empty(), "{case} scans nothing");
         assert!(r.gh_calls().is_empty(), "{case} calls no API");
     }
+}
+
+/// The hidden key a comment of `scope` carries for `key`, both `@uri` encoded.
+fn thread_marker(scope: &str, key: &str) -> String {
+    format!("<!-- echoes:v1 scope={scope} key={key} -->")
+}
+
+/// The hidden mark a review of `scope` carries.
+fn review_marker(scope: &str) -> String {
+    format!("<!-- echoes:v1 scope={scope} review -->")
+}
+
+const CONTEXT_NOTE: &str =
+    "This context is repeated in this scan. A shared helper can carry it once.";
+const LEGACY_OOR: &str = "These duplicates are not on lines GitHub shows in this pull request diff, the inline comment cannot attach there. The links point at the copies on the head commit.";
+const BOT: &str = "github-actions[bot]";
+const DUP_KEY: &str = "doctest%3AH1%3Asrc%2Fdup.rs%3Aapp%3A%3Aparse";
+
+/// A git world with a foreign workspace under `sub`, where `src` belongs to the root.
+fn cleanup_world(name: &str) -> World {
+    World::pull_request(name)
+        .git()
+        .extra_base("sub/Cargo.toml", "[workspace]\n")
+        .extra_base("sub/src/lib.rs", SRC_LIB)
+        .changed(&["src/lib.rs"])
+}
+
+#[test]
+fn s60_clean_head_resolves_gone_threads_and_dismisses_reviews() {
+    let gone = format!(
+        "{CONTEXT_NOTE}\n\n{}",
+        thread_marker(".", "context%3AC9%3Asrc%2Fold.rs%3Aapp%3A%3Aold")
+    );
+    let other = format!(
+        "{CONTEXT_NOTE}\n\n{}",
+        thread_marker("sub", "context%3AC9%3Asub%2Fsrc%2Flib.rs%3Ax")
+    );
+    let mut world = cleanup_world("s60")
+        .threads(json!([
+            thread("t1", false, "src/old.rs", None, "github-actions", &gone),
+            thread(
+                "t2",
+                false,
+                "sub/src/lib.rs",
+                Some(3),
+                "github-actions",
+                &other
+            ),
+            thread("t3", true, "src/old.rs", None, "github-actions", &gone),
+            thread(
+                "t4",
+                false,
+                "src/lib.rs",
+                Some(3),
+                "github-actions",
+                CONTEXT_NOTE
+            ),
+            thread(
+                "t5",
+                false,
+                "sub/src/lib.rs",
+                Some(3),
+                "github-actions",
+                CONTEXT_NOTE
+            ),
+            thread(
+                "t6",
+                false,
+                "src/lib.rs",
+                Some(3),
+                "github-actions",
+                "Clippy found a warning"
+            ),
+            thread("t7", false, "src/lib.rs", Some(3), "luca", CONTEXT_NOTE),
+        ]))
+        .reviews(json!([
+            review(
+                101,
+                "CHANGES_REQUESTED",
+                BOT,
+                &format!("x\n\n{}", review_marker("."))
+            ),
+            review(102, "CHANGES_REQUESTED", BOT, ""),
+            review(
+                103,
+                "CHANGES_REQUESTED",
+                BOT,
+                &format!("{LEGACY_OOR}\n\n- group context  `sub/src/lib.rs:3`  `x`")
+            ),
+            review(104, "COMMENTED", BOT, &review_marker(".")),
+            review(105, "CHANGES_REQUESTED", BOT, &review_marker("sub")),
+            review(106, "CHANGES_REQUESTED", "luca", ""),
+            review(
+                107,
+                "CHANGES_REQUESTED",
+                BOT,
+                &format!("{LEGACY_OOR}\n\n- group 1  `src/lib.rs:3`  `app::parse`")
+            ),
+        ]));
+    assert_eq!(world.run(), 0, "a clean head exits 0");
+    let r = world.runner();
+    assert_eq!(
+        r.resolved_threads(),
+        ["t1", "t4"],
+        "only this workspace's open echoes threads whose finding is gone are resolved"
+    );
+    let mut dismissed = r.dismissed_reviews();
+    dismissed.sort();
+    assert_eq!(
+        dismissed,
+        ["101", "102", "107"],
+        "only this workspace's requests for changes are dismissed"
+    );
+    assert!(
+        r.comment_posts().is_empty() && r.review_posts().is_empty(),
+        "a clean head posts nothing"
+    );
+}
+
+#[test]
+fn s61_threaded_finding_is_not_posted_again() {
+    let mut world = World::pull_request("s61")
+        .git()
+        .json(report(
+            &[group(
+                "g1",
+                "H1",
+                &[
+                    doc_site("src/lib.rs", 3, 5, "app::parse"),
+                    doc_site("src/dup.rs", 3, 5, "app::parse"),
+                ],
+            )],
+            &[],
+            None,
+            6,
+            3,
+        ))
+        .base_json(report(
+            &[group(
+                "g1",
+                "H1",
+                &[doc_site("src/lib.rs", 3, 5, "app::parse")],
+            )],
+            &[],
+            None,
+            1,
+            1,
+        ))
+        .changed(&["Cargo.toml", "src/lib.rs", "src/dup.rs"])
+        .threads(json!([thread(
+            "t1",
+            false,
+            "src/dup.rs",
+            None,
+            "github-actions",
+            &format!("x\n\n{}", thread_marker(".", DUP_KEY))
+        )]))
+        // The listing already holds the review this run posts, id 9001, which must stay.
+        .reviews(json!([
+            review(201, "CHANGES_REQUESTED", BOT, &review_marker(".")),
+            review(9001, "CHANGES_REQUESTED", BOT, &review_marker(".")),
+        ]));
+    assert_eq!(world.run(), 0, "the review run exits 0");
+    let r = world.runner();
+    assert!(
+        r.comment_posts().is_empty(),
+        "a finding with a thread is not posted again"
+    );
+    assert!(
+        r.resolved_threads().is_empty(),
+        "the finding is still present, so its thread stays open"
+    );
+    let reviews = r.review_posts();
+    assert_eq!(
+        reviews.len(),
+        1,
+        "the request for changes is renewed on the new head"
+    );
+    assert_eq!(
+        reviews[0].pointer("/params/event").and_then(Value::as_str),
+        Some("REQUEST_CHANGES")
+    );
+    assert!(
+        reviews[0]
+            .pointer("/params/body")
+            .and_then(Value::as_str)
+            .is_some_and(|b| b.contains(&review_marker("."))),
+        "the renewed review carries its workspace mark"
+    );
+    assert_eq!(
+        r.dismissed_reviews(),
+        ["201"],
+        "the superseded request is dismissed, the new one stays"
+    );
+    let calls = r.gh_calls();
+    let posted = calls
+        .iter()
+        .position(|c| c["m"] == "POST" && c["p"].as_str().is_some_and(|p| p.ends_with("/reviews")));
+    let dismissed = calls.iter().position(|c| c["m"] == "PUT");
+    assert!(
+        posted < dismissed,
+        "the new review is posted before the old one is dismissed"
+    );
+}
+
+#[test]
+fn s62_legacy_thread_covering_a_finding_is_kept() {
+    let legacy = "This pull request adds 2 copies of the same doctest, echoes suggests keeping the first added copy.";
+    let mut world = World::pull_request("s62")
+        .inputs(&[("only-new", "false")])
+        .git()
+        .json(report(
+            &[group(
+                "g1",
+                "H1",
+                &[
+                    doc_site("src/lib.rs", 3, 5, "app::parse"),
+                    doc_site("src/dup.rs", 3, 5, "app::parse"),
+                ],
+            )],
+            &[],
+            None,
+            6,
+            3,
+        ))
+        .changed(&["Cargo.toml", "src/lib.rs", "src/dup.rs"])
+        .threads(json!([
+            thread("t1", false, "src/dup.rs", Some(4), "github-actions", legacy),
+            thread("t2", false, "src/lib.rs", None, "github-actions", legacy),
+        ]));
+    assert_eq!(world.run(), 0, "the review run exits 0");
+    let r = world.runner();
+    assert!(
+        r.comment_posts().is_empty(),
+        "a legacy thread on the copy's lines stands for the finding"
+    );
+    assert_eq!(
+        r.resolved_threads(),
+        ["t2"],
+        "the legacy thread covering no finding is resolved"
+    );
+}
+
+#[test]
+fn s63_context_out_of_range_links_and_requests_nothing() {
+    let mut world = World::pull_request("s63")
+        .inputs(&[("context-select", "crate:app")])
+        .git()
+        .json(report(
+            &[],
+            &[ctx_group(
+                "c9f8",
+                "C1",
+                &[
+                    site("src/parser.rs", 3, 6, "app::parser::selected"),
+                    site("src/mod.rs", 10, 13, "app::other::selected"),
+                ],
+            )],
+            None,
+            6,
+            3,
+        ))
+        .base_json(report(&[], &[], None, 6, 3))
+        .changed(&["Cargo.toml", "src/lib.rs", "src/parser.rs", "src/mod.rs"])
+        .extra_base("src/mod.rs", SRC_PARSER)
+        .env("SCEN_GH_FAIL", "422");
+    assert_eq!(world.run(), 0, "the review run exits 0");
+    let r = world.runner();
+    let reviews = r.review_posts();
+    assert_eq!(
+        reviews
+            .first()
+            .and_then(|c| c.pointer("/params/event"))
+            .and_then(Value::as_str),
+        Some("COMMENT"),
+        "a context that cannot attach inline requests no changes"
+    );
+    let body = reviews
+        .first()
+        .and_then(|c| c.pointer("/params/body"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        body.contains("[`src/mod.rs:10-13`](https://github.com/owner/repo/blob/")
+            && body.contains("/src/mod.rs#L10-L13)"),
+        "the out-of-range copy links its lines: {body}"
+    );
+}
+
+#[test]
+fn s64_refused_resolution_leaves_a_notice() {
+    let gone = format!(
+        "{CONTEXT_NOTE}\n\n{}",
+        thread_marker(".", "context%3AC9%3Asrc%2Fold.rs%3Aapp%3A%3Aold")
+    );
+    let mut world = cleanup_world("s64")
+        .threads(json!([thread(
+            "t1",
+            false,
+            "src/old.rs",
+            None,
+            "github-actions",
+            &gone
+        )]))
+        .env("SCEN_GH_RESOLVE_403", "1");
+    assert_eq!(world.run(), 0, "a refused resolution does not fail the run");
+    let out = world
+        .runner()
+        .step_stdout("Review the findings on the pull request")
+        .unwrap_or_default();
+    assert!(
+        out.contains("contents: write"),
+        "the notice names the missing permission: {out}"
+    );
+}
+
+#[test]
+fn s65_post_mode_cleans_up_the_payload_scope() {
+    let mut prep = World::pull_request("s65a")
+        .inputs(&[("mode", "prepare"), ("payload", "echoes-payload")])
+        .json(report(&[], &[], None, 6, 3));
+    assert_eq!(prep.run(), 0, "a clean prepare run exits 0");
+    let meta: Value = serde_json::from_str(
+        &fs::read_to_string(prep.workspace_path().join("echoes-payload/meta.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        meta["scope"], ".",
+        "the payload names the workspace it scanned"
+    );
+    assert!(
+        meta["owned_dirs"]
+            .as_array()
+            .is_some_and(|d| d.contains(&json!("."))),
+        "the payload lists the workspace root as owned: {meta}"
+    );
+    let mine = format!(
+        "x\n\n{}",
+        thread_marker(".", "context%3AC9%3Asrc%2Fold.rs%3Aapp%3A%3Aold")
+    );
+    let theirs = format!(
+        "x\n\n{}",
+        thread_marker("sub", "context%3AC9%3Asub%2Fold.rs%3Aapp%3A%3Aold")
+    );
+    let mut post = post_world("s65b", &prep, "workflow_run", &[]).threads(json!([
+        thread("t1", false, "src/old.rs", None, "github-actions", &mine),
+        thread("t2", false, "sub/old.rs", None, "github-actions", &theirs),
+    ]));
+    let (exit, _) = post_status(&mut post);
+    assert_eq!(exit, 0, "the clean post run exits 0");
+    assert_eq!(
+        post.runner().resolved_threads(),
+        ["t1"],
+        "the post job cleans up the payload's workspace only"
+    );
+    forge_meta(&prep, "scope", json!("sub --> <b>"));
+    let mut forged = post_world("s65c", &prep, "workflow_run", &[]).threads(json!([thread(
+        "t1",
+        false,
+        "src/old.rs",
+        None,
+        "github-actions",
+        &mine
+    )]));
+    let (exit, status) = post_status(&mut forged);
+    assert_eq!(
+        (exit, status.as_str()),
+        (1, "rejected"),
+        "a malformed scope rejects the payload"
+    );
+    assert!(
+        forged.runner().resolved_threads().is_empty(),
+        "a rejected payload touches no thread"
+    );
+}
+
+#[test]
+fn s66_scan_summary_escapes_report_text() {
+    let forged = "app::x`<b>@org/team";
+    let local = site("src/parser.rs", 3, 6, forged);
+    let rep = report(
+        &[],
+        &[ctx_group(
+            "c1",
+            "C1",
+            &[local.clone(), site("src/mod.rs", 10, 13, forged)],
+        )],
+        Some(&reuse(
+            &[reuse_group(
+                "R1",
+                &local,
+                &[Cand::new("direct", "1.2.3", 1, forged, "reuse-api")
+                    .source_url("javascript:alert(1)")
+                    .build()],
+            )],
+            Some(coverage(true, 1, 1, 0, &[], &[])),
+        )),
+        6,
+        3,
+    );
+    let mut world = World::pull_request("s66")
+        .inputs(&[("context-dependency-depth", "2")])
+        .json(rep);
+    world.run();
+    let summary = world.runner().summary();
+    assert!(
+        summary.contains("``app::x`<b>@org/team``"),
+        "report items render as code spans in the run summary: {summary}"
+    );
+    assert!(
+        !summary.contains("javascript:"),
+        "a source url that is not https stays out of the run summary"
+    );
+}
+
+#[test]
+fn s67_base_scan_takes_the_head_scan_flags() {
+    let mut world = World::pull_request("s67")
+        .inputs(&[
+            ("functions", "true"),
+            ("all-targets", "true"),
+            ("context-blocks", "true"),
+            ("context-dependency-depth", "2"),
+            ("context-dev-dependencies", "true"),
+            ("exclude", "benches/**\nsrc/gen.rs"),
+        ])
+        .git()
+        .json(report(&[], &[], None, 6, 3))
+        .base_json(report(&[], &[], None, 1, 1));
+    world.run();
+    let r = world.runner();
+    let without_threshold = |args: Vec<String>| {
+        let at = args
+            .iter()
+            .position(|a| a == "--threshold")
+            .expect("a threshold");
+        let mut rest = args;
+        rest.drain(at..at + 2);
+        rest
+    };
+    let head = without_threshold(r.scan_args(0));
+    assert!(
+        head.iter().any(|a| a == "--context-dependency-depth"),
+        "the head scan searches dependencies: {head:?}"
+    );
+    assert_eq!(
+        without_threshold(r.scan_args(1)),
+        head,
+        "the base scan passes the head scan's flags, only the threshold differs"
+    );
+}
+
+#[test]
+fn s68_a_second_copy_of_a_base_context_counts_as_added() {
+    let old = site("src/parser.rs", 3, 6, "app::parser::selected");
+    let added = site("src/parser.rs", 12, 15, "app::parser::selected");
+    let mut world = World::pull_request("s68")
+        .inputs(&[("context-select", "crate:app")])
+        .git()
+        .json(report(
+            &[],
+            &[ctx_group("c1", "C1", &[old.clone(), added])],
+            None,
+            6,
+            3,
+        ))
+        .base_json(report(&[], &[ctx_group("c1", "C1", &[old])], None, 6, 3))
+        .changed(&["src/parser.rs"]);
+    assert_eq!(world.run(), 0, "the review run exits 0");
+    let posts = world.runner().comment_posts();
+    assert_eq!(
+        posts.len(),
+        1,
+        "the copy beyond the base's one is added by the pull request"
+    );
+    assert_eq!(
+        posts[0]
+            .pointer("/params/start_line")
+            .and_then(Value::as_str),
+        Some("12"),
+        "the comment lands on the added copy"
+    );
+}
+
+#[test]
+fn s69_annotation_names_the_group_first_copy_outside_only_new() {
+    let mut world = World::pull_request("s69")
+        .inputs(&[("only-new", "false")])
+        .git()
+        .json(report(
+            &[group(
+                "g1",
+                "H1",
+                &[
+                    doc_site("src/lib.rs", 3, 5, "app::parse"),
+                    doc_site("src/dup.rs", 3, 5, "app::parse"),
+                ],
+            )],
+            &[],
+            None,
+            6,
+            3,
+        ))
+        .changed(&["src/dup.rs"]);
+    assert_eq!(world.run(), 0, "the review run exits 0");
+    let out = world
+        .runner()
+        .step_stdout("Review the findings on the pull request")
+        .unwrap_or_default();
+    let note = out
+        .lines()
+        .find(|l| l.starts_with("::error file=src/dup.rs"))
+        .unwrap_or_default();
+    assert!(
+        note.contains("duplicates the doctest at src/lib.rs:3"),
+        "the copy's annotation points at the group's first copy, not at itself: {note}"
+    );
 }

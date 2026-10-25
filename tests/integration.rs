@@ -359,6 +359,38 @@ fn binary_runs_end_to_end() {
 
 #[test]
 #[cfg(feature = "cli")]
+fn an_excluded_member_leaves_the_scan() {
+    let bin = env!("CARGO_BIN_EXE_cargo-echoes");
+    let files = |extra: &[&str]| {
+        let out = Command::new(bin)
+            .current_dir(FIXTURE)
+            .args(["echoes", "--json", "--no-fail"])
+            .args(extra)
+            .output()
+            .expect("run echoes binary");
+        assert_eq!(out.status.code(), Some(0), "{extra:?}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let mut files: Vec<String> = value["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["sites"].as_array().unwrap().iter())
+            .map(|site| site["file"].as_str().unwrap().to_string())
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    };
+    assert!(files(&[]).iter().any(|file| file.starts_with("beta/")));
+    let kept = files(&["--exclude", "beta/", "--exclude", "*.md"]);
+    assert!(
+        kept.iter().all(|file| !file.starts_with("beta/")),
+        "{kept:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "cli")]
 fn binary_prints_annotations_beside_the_report() {
     let bin = env!("CARGO_BIN_EXE_cargo-echoes");
     let out = Command::new(bin)
@@ -451,35 +483,30 @@ fn a_bare_organization_flag_scans_the_current_repository_owner() {
 
 #[test]
 #[cfg(feature = "cli")]
-fn organizations_and_repositories_are_alternative_selections() {
+fn organizations_and_repositories_join_one_selection() {
     let dir = tempfile::tempdir().unwrap();
     let bin = env!("CARGO_BIN_EXE_cargo-echoes");
-    let run = |args: &[&str]| {
-        Command::new(bin)
-            .current_dir(dir.path())
-            .args(args)
-            .output()
-            .expect("run echoes binary")
-    };
-    let out = run(&["echoes", "--organization", "o", "--repository", "o/app"]);
-    assert_eq!(out.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("cannot be used with"), "{stderr}");
-    // Malformed repository names are refused before any request, so no network is needed.
-    let out = run(&[
-        "echoes",
-        "--repository",
-        "app",
-        "--repository",
-        "o/../x",
-        "--no-fail",
-        "--json",
-    ]);
+    // Malformed names are refused before any request, so no network is needed.
+    let out = Command::new(bin)
+        .current_dir(dir.path())
+        .args([
+            "echoes",
+            "--organization=-bad",
+            "--repository",
+            "app",
+            "--repository",
+            "o/../x",
+            "--no-fail",
+            "--json",
+        ])
+        .output()
+        .expect("run echoes binary");
     assert_eq!(out.status.code(), Some(2));
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
         report["organization"]["coverage"]["failures"],
         serde_json::json!([
+            "-bad: the organization login is not a valid GitHub login",
             "app: is not an owner/repository name",
             "o/../x: is not an owner/repository name"
         ])

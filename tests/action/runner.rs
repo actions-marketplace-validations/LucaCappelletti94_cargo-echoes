@@ -27,7 +27,6 @@ const STANDARD_PATH: &[&str] = &[
 /// One `uses` step the runner recorded.
 pub struct Use {
     pub name: String,
-    pub uses: String,
     pub with: BTreeMap<String, String>,
 }
 
@@ -172,26 +171,54 @@ impl Runner {
         out
     }
 
-    pub fn comment_posts(&self) -> Vec<Value> {
+    /// The POST calls whose path ends with `suffix`, in call order.
+    fn posts_to(&self, suffix: &str) -> Vec<Value> {
         self.gh_calls()
             .into_iter()
             .filter(|c| {
                 c.get("m").and_then(Value::as_str) == Some("POST")
                     && c.get("p")
                         .and_then(Value::as_str)
-                        .is_some_and(|p| p.ends_with("/comments"))
+                        .is_some_and(|p| p.ends_with(suffix))
             })
             .collect()
     }
 
+    pub fn comment_posts(&self) -> Vec<Value> {
+        self.posts_to("/comments")
+    }
+
     pub fn review_posts(&self) -> Vec<Value> {
+        self.posts_to("/reviews")
+    }
+
+    /// The thread ids the run resolved, in call order.
+    pub fn resolved_threads(&self) -> Vec<String> {
         self.gh_calls()
             .into_iter()
             .filter(|c| {
-                c.get("m").and_then(Value::as_str) == Some("POST")
-                    && c.get("p")
+                c.get("p").and_then(Value::as_str) == Some("graphql")
+                    && c.pointer("/params/query")
                         .and_then(Value::as_str)
-                        .is_some_and(|p| p.ends_with("/reviews"))
+                        .is_some_and(|q| q.contains("resolveReviewThread"))
+            })
+            .filter_map(|c| {
+                c.pointer("/params/threadId")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .collect()
+    }
+
+    /// The review ids the run dismissed, in call order.
+    pub fn dismissed_reviews(&self) -> Vec<String> {
+        self.gh_calls()
+            .into_iter()
+            .filter(|c| c.get("m").and_then(Value::as_str) == Some("PUT"))
+            .filter_map(|c| {
+                let path = c.get("p").and_then(Value::as_str)?;
+                let rest = path.strip_suffix("/dismissals")?;
+                rest.rsplit('/').next().map(String::from)
             })
             .collect()
     }
@@ -263,7 +290,7 @@ impl Runner {
                 self.steps.push((name, "skipped-after-failure"));
                 continue;
             }
-            if let Some(uses) = step.get("uses").and_then(Value::as_str) {
+            if step.get("uses").is_some() {
                 let mut with = BTreeMap::new();
                 if let Some(withs) = step.get("with").and_then(Value::as_object) {
                     for (k, v) in withs {
@@ -275,7 +302,6 @@ impl Runner {
                 }
                 self.uses.push(Use {
                     name: name.clone(),
-                    uses: uses.to_string(),
                     with,
                 });
                 self.steps.push((name, "used"));
@@ -409,6 +435,10 @@ impl Runner {
         env.insert("RUNNER_ARCH".into(), "X64".into());
         env.insert("RUNNER_TEMP".into(), self.run_temp.clone());
         env.insert("GITHUB_WORKSPACE".into(), self.workspace.clone());
+        env.insert(
+            "GITHUB_ACTION_PATH".into(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
+        );
         env.insert(
             "GITHUB_REPOSITORY".into(),
             self.github

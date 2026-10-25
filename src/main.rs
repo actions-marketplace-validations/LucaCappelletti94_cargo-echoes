@@ -30,9 +30,9 @@ struct Args {
         action = clap::ArgAction::Append
     )]
     organization: Option<Vec<String>>,
-    /// Scan exactly this GitHub repository, whoever owns it. Repeat it to scan several as one
-    /// corpus.
-    #[arg(long, value_name = "OWNER/REPO", conflicts_with = "organization")]
+    /// Scan this GitHub repository, whoever owns it, alone or beside the organizations.
+    /// Repeat it to scan several as one corpus.
+    #[arg(long, value_name = "OWNER/REPO")]
     repository: Vec<String>,
     /// Scan bin and example doctests in addition to lib doctests.
     #[arg(long)]
@@ -97,6 +97,11 @@ struct Args {
     /// Include dependency reuse findings in the duplicate gate.
     #[arg(long)]
     context_fail_on_reuse: bool,
+    /// Leave out files matching this gitignore-style glob, relative to the workspace or every
+    /// repository root, or to one repository after an `owner/repo:` prefix. Repeat it for
+    /// several, they add to the config file's `exclude`.
+    #[arg(long, value_name = "GLOB")]
+    exclude: Vec<String>,
     /// Explicit `.echoes.toml` location.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -157,6 +162,9 @@ fn run(args: Args) -> echoes::Result<ExitCode> {
     if let Some(scope) = args.context_search {
         scan = scan.context_search(scope);
     }
+    for pattern in &args.exclude {
+        scan = scan.exclude(pattern)?;
+    }
     scan = scan.context_dependencies(echoes::DependencySearch {
         depth: args.context_dependency_depth,
         include_dev: args.context_dev_dependencies.then_some(true),
@@ -173,22 +181,22 @@ fn run(args: Args) -> echoes::Result<ExitCode> {
     if let Some(config) = args.config {
         scan = scan.config(config)?;
     }
-    let report = match (args.organization, args.repository) {
-        (Some(organizations), _) => {
-            let owners = organizations
-                .into_iter()
-                .map(|name| {
-                    if name.is_empty() {
-                        echoes::repository_owner(".")
-                    } else {
-                        Ok(name)
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            scan.run_organizations(&owners)?
-        }
-        (None, repositories) if !repositories.is_empty() => scan.run_repositories(&repositories)?,
-        (None, _) => scan.run(Path::new("."))?,
+    let report = if args.organization.is_some() || !args.repository.is_empty() {
+        let owners = args
+            .organization
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| {
+                if name.is_empty() {
+                    echoes::repository_owner(".")
+                } else {
+                    Ok(name)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        scan.run_selected(&owners, &args.repository)?
+    } else {
+        scan.run(Path::new("."))?
     };
     let out = if args.json {
         echoes::json(&report)
