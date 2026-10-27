@@ -1377,9 +1377,27 @@ fn label_binary(
     locals: &mut usize,
     orders: Option<&RefCell<FieldOrders>>,
 ) -> (Lbl, Vec<Site>) {
+    if let Some((left, right)) = borrowed_comparison(bin) {
+        let (left, mut sites) = label_expr(renamer, env, left, consumer, locals, orders);
+        let (right, r_sites) = label_expr(renamer, env, right, consumer, locals, orders);
+        if left.prim().is_some() && right.prim().is_some() {
+            sites.extend(r_sites);
+            return binary_label(bin, left, right, sites);
+        }
+    }
     let (left, mut sites) = label_expr(renamer, env, &bin.left, consumer, locals, orders);
     let (right, r_sites) = label_expr(renamer, env, &bin.right, consumer, locals, orders);
     sites.extend(r_sites);
+    binary_label(bin, left, right, sites)
+}
+
+/// The label of the binary operation `bin` over its operand labels and their sites.
+fn binary_label(
+    bin: &syn::ExprBinary,
+    left: Lbl,
+    right: Lbl,
+    mut sites: Vec<Site>,
+) -> (Lbl, Vec<Site>) {
     let label = if bin.attrs.is_empty()
         && let Some(reduced) = equality_label(bin.op, &left, &right)
     {
@@ -1488,6 +1506,16 @@ fn label_call(
     locals: &mut usize,
     orders: Option<&RefCell<FieldOrders>>,
 ) -> (Lbl, Vec<Site>) {
+    if let Some((name, target)) = from_conversion(renamer, call) {
+        let (value, sites) = label_expr(renamer, env, &call.args[0], consumer, locals, orders);
+        match value.prim() {
+            Some(source) if source == target => return (value, sites),
+            Some(source) if lossless(source, target) => {
+                return (cast_label(renamer, value, name), sites);
+            }
+            _ => {}
+        }
+    }
     let (callee, mut sites) = label_expr(renamer, env, &call.func, consumer, locals, orders);
     let mut args: Vec<Lbl> = Vec::new();
     for arg in &call.args {
@@ -1549,6 +1577,9 @@ fn label_method(
 ) -> (Lbl, Vec<Site>) {
     let (receiver, receiver_sites) =
         label_expr(renamer, env, &method.receiver, consumer, locals, orders);
+    if clone_call(method) && receiver.prim().is_some() && renamer.clone_free() {
+        return (receiver, receiver_sites);
+    }
     let mut sites: Vec<_> = receiver_sites
         .into_iter()
         .map(|site| Site {
@@ -1667,6 +1698,15 @@ fn label_unary(
     locals: &mut usize,
     orders: Option<&RefCell<FieldOrders>>,
 ) -> (Lbl, Vec<Site>) {
+    if matches!(unary.op, syn::UnOp::Deref(_))
+        && unary.attrs.is_empty()
+        && let Some(inner) = shared_borrow(&unary.expr)
+    {
+        let (label, sites) = label_expr(renamer, env, inner, consumer, locals, orders);
+        if label.prim().is_some() {
+            return (label, sites);
+        }
+    }
     let (inner, sites) = label_expr(renamer, env, &unary.expr, consumer, locals, orders);
     let label = if matches!(unary.op, syn::UnOp::Not(_))
         && unary.attrs.is_empty()
@@ -1677,6 +1717,35 @@ fn label_unary(
         Lbl::Other("u".into(), vec![inner])
     };
     (label, sites)
+}
+
+/// The operand of an unattributed shared borrow `&e`.
+pub(crate) fn shared_borrow(expr: &syn::Expr) -> Option<&syn::Expr> {
+    match expr {
+        syn::Expr::Reference(reference)
+            if reference.attrs.is_empty() && reference.mutability.is_none() =>
+        {
+            Some(&reference.expr)
+        }
+        _ => None,
+    }
+}
+
+/// The operands of an `==` or `!=` between two shared borrows, which compares the referents.
+pub(crate) fn borrowed_comparison(bin: &syn::ExprBinary) -> Option<(&syn::Expr, &syn::Expr)> {
+    if !matches!(bin.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) || !bin.attrs.is_empty() {
+        return None;
+    }
+    Some((shared_borrow(&bin.left)?, shared_borrow(&bin.right)?))
+}
+
+/// Whether a call is an unattributed `clone()` without turbofish, which on a proven primitive
+/// copies its receiver when `Renamer::clone_free` holds.
+pub(crate) fn clone_call(method: &syn::ExprMethodCall) -> bool {
+    method.attrs.is_empty()
+        && method.turbofish.is_none()
+        && method.args.is_empty()
+        && crate::scope::ident_name(&method.method) == "clone"
 }
 
 /// The single unattributed, bounded value tail of a clean block.
@@ -2506,16 +2575,73 @@ fn label_cast(
     let (value, sites) = label_expr(renamer, env, &cast.expr, consumer, locals, orders);
     let ty = match &*cast.ty {
         syn::Type::Path(path) if path.qself.is_none() => {
-            if path.path.segments.len() == 1 {
-                let name = path.path.segments[0].ident.to_string();
-                renamer.type_identity(unraw(&name)).text()
-            } else {
-                path_text(&path.path)
+            if let Some(name) = path.path.get_ident() {
+                if value.prim().is_some() && value.prim() == renamer.type_name_prim(name) {
+                    return (value, sites);
+                }
+                return (cast_label(renamer, value, name), sites);
             }
+            path_text(&path.path)
         }
         _ => "?".into(),
     };
     (Lbl::Other("cast".into(), vec![value, Lbl::Lit(ty)]), sites)
+}
+
+/// The label of a cast of `value` to the single type name `name`.
+fn cast_label(renamer: &Renamer, value: Lbl, name: &syn::Ident) -> Lbl {
+    let ty = renamer.type_identity(unraw(&name.to_string())).text();
+    Lbl::Other("cast".into(), vec![value, Lbl::Lit(ty)])
+}
+
+/// Whether the standard library converts `source` into `target` with a lossless `From` impl:
+/// `bool` into any integer, and an integer into a wider one that keeps its sign or gains one.
+pub(crate) fn lossless(source: PrimTy, target: PrimTy) -> bool {
+    match (source, target) {
+        (PrimTy::Bool, PrimTy::Int { .. }) => true,
+        (
+            PrimTy::Int {
+                width: from,
+                signed: from_signed,
+            },
+            PrimTy::Int {
+                width: to,
+                signed: to_signed,
+            },
+        ) => to.bits() > from.bits() && (to_signed || !from_signed),
+        _ => false,
+    }
+}
+
+/// The type name and proven primitive `T` of an unattributed `T::from(x)` whose `from`
+/// resolves through the standard `From` of the prelude.
+pub(crate) fn from_conversion<'c>(
+    renamer: &Renamer,
+    call: &'c syn::ExprCall,
+) -> Option<(&'c syn::Ident, PrimTy)> {
+    let syn::Expr::Path(path) = &*call.func else {
+        return None;
+    };
+    if !call.attrs.is_empty()
+        || call.args.len() != 1
+        || !path.attrs.is_empty()
+        || path.qself.is_some()
+        || path.path.leading_colon.is_some()
+    {
+        return None;
+    }
+    let mut segments = path.path.segments.iter();
+    let (Some(ty), Some(method), None) = (segments.next(), segments.next(), segments.next()) else {
+        return None;
+    };
+    if !ty.arguments.is_none()
+        || !method.arguments.is_none()
+        || crate::scope::ident_name(&method.ident) != "from"
+        || !renamer.prelude_trait("From")
+    {
+        return None;
+    }
+    Some((&ty.ident, renamer.type_name_prim(&ty.ident)?))
 }
 
 /// The label of a raw pointer expression, its inner sites marked on the

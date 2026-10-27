@@ -178,6 +178,22 @@ pub mod alpha {
         if flag { return value; }
         0u32
     }
+    pub fn slot(slot: Option<u32>) -> u32 {
+        let Some(value) = slot else { return 0u32; };
+        match value { 0 => 1u32, 1 => 1u32, _ => value }
+    }
+    pub fn label() -> String {
+        String::from("sentinel")
+    }
+    pub fn widened(value: u32, flag: bool) -> u64 {
+        u64::from(value) + flag as u64
+    }
+    pub fn picked<'a, T>(values: &'a [T]) -> Option<&'a T> where T: Ord + Copy {
+        values.iter().max()
+    }
+    pub fn copied(value: u32, other: u32) -> bool {
+        &value == &other
+    }
 }
 mod custom {
     macro_rules! vec {

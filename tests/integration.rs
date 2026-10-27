@@ -1365,6 +1365,179 @@ fn early_return_functions_group_with_branches_and_else_if_ladders() {
     assert_eq!(function_groups(&scan(10)).len(), 0);
 }
 
+const OR_ARMS_FIXTURE: &str = "tests/fixtures/orarmsws";
+
+#[test]
+fn split_arm_doctests_group_with_their_or_pattern() {
+    let report = Echoes::default().run(OR_ARMS_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["orarmsws::Joined", "orarmsws::Split"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(27)
+        .run(OR_ARMS_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(28)
+        .run(OR_ARMS_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn let_else_functions_group_with_their_match() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(OR_ARMS_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["orarmsws::matched", "orarmsws::unwrapped"]];
+    for tokens in [0, 15] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(16)).len(), 0);
+}
+
+const PRELUDE_FIXTURE: &str = "tests/fixtures/preludews";
+
+#[test]
+fn owned_string_doctests_group_across_their_spellings() {
+    let report = Echoes::default().run(PRELUDE_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["preludews::Constructed", "preludews::Owned"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(24)
+        .run(PRELUDE_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(25)
+        .run(PRELUDE_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn empty_vector_functions_group_only_under_the_prelude() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(PRELUDE_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["preludews::empty", "preludews::fresh"]];
+    for tokens in [0, 11] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(12)).len(), 0);
+}
+
+const CAST_FIXTURE: &str = "tests/fixtures/castws";
+
+#[test]
+fn widening_cast_doctests_group_with_their_conversions() {
+    let report = Echoes::default().run(CAST_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["castws::Cast", "castws::Converted"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default().min_tokens(19).run(CAST_FIXTURE).unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default().min_tokens(20).run(CAST_FIXTURE).unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn widening_cast_functions_group_with_their_conversions() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(CAST_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["castws::converted", "castws::widened"]];
+    for tokens in [0, 7] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(8)).len(), 0);
+}
+
+const ELISION_FIXTURE: &str = "tests/fixtures/elisionws";
+
+#[test]
+fn named_lifetime_doctests_group_with_their_elided_form() {
+    let report = Echoes::default().run(ELISION_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["elisionws::Elided", "elisionws::Named"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(25)
+        .run(ELISION_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(26)
+        .run(ELISION_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn reordered_bound_functions_group() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(ELISION_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["elisionws::biggest", "elisionws::largest"]];
+    for tokens in [0, 7] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(8)).len(), 0);
+}
+
+const COPY_FIXTURE: &str = "tests/fixtures/copyws";
+
+#[test]
+fn cloned_comparison_doctests_group_with_their_plain_form() {
+    let report = Echoes::default().run(COPY_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["copyws::Cloned", "copyws::Plain"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default().min_tokens(18).run(COPY_FIXTURE).unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default().min_tokens(19).run(COPY_FIXTURE).unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn primitive_copy_functions_group_with_their_plain_form() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(COPY_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["copyws::direct", "copyws::mixed"]];
+    for tokens in [0, 5] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(6)).len(), 0);
+}
+
 const CONTEXT_FIXTURE: &str = "tests/fixtures/contextws";
 
 fn context_scan() -> Report {

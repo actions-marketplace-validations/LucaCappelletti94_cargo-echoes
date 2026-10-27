@@ -62,7 +62,7 @@ struct ModuleId(usize);
 /// One indexed module: its seed frame and its own glob uncertainty.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "primitive, derive, observer and helper facts of a module are independent"
+    reason = "primitive, derive, observer, helper and prelude facts of a module are independent"
 )]
 struct Module {
     seed: Frame,
@@ -71,6 +71,10 @@ struct Module {
     std_names: bool,
     observed: bool,
     helper_blocked: bool,
+    /// No attribute on the module, an ancestor or the crate root removes the standard prelude.
+    prelude: bool,
+    /// Every `use` of the module imports from `std`, `core` or `alloc`.
+    standard_imports: bool,
 }
 
 /// One original declaration and its module environment.
@@ -101,6 +105,10 @@ pub struct SourceContext<'a> {
     gen_frames: BTreeMap<*const syn::Generics, Frame>,
     /// Complete helper summaries shared by every borrowed declaration.
     helpers: crate::helpers::HelperTable,
+    /// No trait of the crate declares a method named `to_string` or `to_owned`.
+    owned_methods: bool,
+    /// No trait of the crate declares a method named `clone`.
+    clone_method: bool,
 }
 
 /// A function view selected from a source context.
@@ -152,6 +160,11 @@ impl FunctionView<'_> {
                 observed: self.entry.observed,
                 enclosing_observed: self.entry.enclosing_observed,
                 std_names: self.ctx.modules[self.entry.module.0].std_names,
+                prelude: self.ctx.modules[self.entry.module.0].prelude,
+                owned_methods: self.ctx.owned_methods,
+                clone_free: self.ctx.modules[self.entry.module.0].prelude
+                    && self.ctx.modules[self.entry.module.0].standard_imports
+                    && self.ctx.clone_method,
                 self_owner,
                 helper_table: Some(&self.ctx.helpers),
                 helper_module: &self.entry.helper_module,
@@ -204,14 +217,12 @@ impl<'a> SourceContext<'a> {
             .any(|(_, file)| crate::drift::file_rebound(file) != 0);
         let blocked: BTreeSet<Vec<String>> = ancestry
             .iter()
-            .filter(|(_, (_, blocked))| *blocked)
+            .filter(|(_, flags)| flags.blocked)
             .map(|(path, _)| path.clone())
             .collect();
         let mut module_ids: ModuleIds = BTreeMap::new();
         let mut modules: Vec<Module> = Vec::new();
-        for ((path, declarations), &(observed, helper_blocked)) in
-            scopes.iter().zip(ancestry.values())
-        {
+        for ((path, declarations), ancestry) in scopes.iter().zip(ancestry.values()) {
             let ids = declarations
                 .iter()
                 .map(|scope| {
@@ -221,8 +232,10 @@ impl<'a> SourceContext<'a> {
                         seed: seed_frame(&scopes, path, &scope, prim_fallback),
                         prim_fallback,
                         std_names: !crate_rebound && std_names_kept(&scopes, path, &scope),
-                        observed,
-                        helper_blocked,
+                        observed: ancestry.observed,
+                        helper_blocked: ancestry.blocked,
+                        prelude: !ancestry.bare,
+                        standard_imports: standard_imports(scope.items()),
                     });
                     (scope.key(), id)
                 })
@@ -251,11 +264,19 @@ impl<'a> SourceContext<'a> {
                 &mut gen_frames,
             );
         }
+        let owned_methods = !files
+            .iter()
+            .any(|(_, file)| declares_trait_method(&file.items, &["to_string", "to_owned"]));
+        let clone_method = !files
+            .iter()
+            .any(|(_, file)| declares_trait_method(&file.items, &["clone"]));
         Self {
             modules,
             decls,
             gen_frames,
             helpers,
+            owned_methods,
+            clone_method,
         }
     }
 
@@ -456,25 +477,38 @@ pub(crate) fn register_inline<'a>(
     }
 }
 
-fn module_ancestry(scopes: &ModuleMap<'_>) -> BTreeMap<Vec<String>, (bool, bool)> {
-    let mut direct: BTreeMap<Vec<String>, (bool, bool)> = BTreeMap::new();
+/// The attribute facts a module inherits from itself and every ancestor.
+#[derive(Clone, Copy, Default)]
+struct Ancestry {
+    observed: bool,
+    blocked: bool,
+    /// An attribute on the module or an ancestor may remove the standard prelude.
+    bare: bool,
+}
+
+impl Ancestry {
+    fn absorb(&mut self, attrs: &[syn::Attribute]) {
+        self.observed |= live_attr(attrs);
+        self.blocked |= blocking_attr(attrs);
+        self.bare |= removes_prelude(attrs);
+    }
+}
+
+fn module_ancestry(scopes: &ModuleMap<'_>) -> BTreeMap<Vec<String>, Ancestry> {
+    let mut direct: BTreeMap<Vec<String>, Ancestry> = BTreeMap::new();
     for (path, declarations) in scopes {
         if declarations.repeated() {
-            direct.entry(path.clone()).or_default().1 = true;
+            direct.entry(path.clone()).or_default().blocked = true;
         }
         for scope in declarations.iter() {
             if let ModuleScope::File(file) = scope {
-                let flags = direct.entry(path.clone()).or_default();
-                flags.0 |= live_attr(&file.attrs);
-                flags.1 |= blocking_attr(&file.attrs);
+                direct.entry(path.clone()).or_default().absorb(&file.attrs);
             }
             for item in scope.items() {
                 if let syn::Item::Mod(module) = item {
                     let mut child = path.clone();
                     child.push(ident_name(&module.ident));
-                    let flags = direct.entry(child).or_default();
-                    flags.0 |= live_attr(&module.attrs);
-                    flags.1 |= blocking_attr(&module.attrs);
+                    direct.entry(child).or_default().absorb(&module.attrs);
                 }
             }
         }
@@ -482,11 +516,12 @@ fn module_ancestry(scopes: &ModuleMap<'_>) -> BTreeMap<Vec<String>, (bool, bool)
     scopes
         .keys()
         .map(|path| {
-            let mut flags = (false, false);
+            let mut flags = Ancestry::default();
             for end in 0..=path.len() {
-                if let Some(&(observed, blocked)) = direct.get(&path[..end]) {
-                    flags.0 |= observed;
-                    flags.1 |= blocked;
+                if let Some(direct) = direct.get(&path[..end]) {
+                    flags.observed |= direct.observed;
+                    flags.blocked |= direct.blocked;
+                    flags.bare |= direct.bare;
                 }
             }
             (path.clone(), flags)
@@ -497,8 +532,77 @@ fn module_ancestry(scopes: &ModuleMap<'_>) -> BTreeMap<Vec<String>, (bool, bool)
 pub(crate) fn blocked_modules(scopes: &ModuleMap<'_>) -> BTreeSet<Vec<String>> {
     module_ancestry(scopes)
         .into_iter()
-        .filter_map(|(path, (_, blocked))| blocked.then_some(path))
+        .filter_map(|(path, flags)| flags.blocked.then_some(path))
         .collect()
+}
+
+/// Whether attributes may remove the standard prelude: `no_std`, `no_implicit_prelude`, or a
+/// `cfg_attr` that may apply either.
+pub(crate) fn removes_prelude(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        let path = attr.path();
+        path.is_ident("no_std")
+            || path.is_ident("no_implicit_prelude")
+            || (path.is_ident("cfg_attr")
+                && attr
+                    .meta
+                    .to_token_stream()
+                    .into_iter()
+                    .any(|token| prelude_attribute_token(&token)))
+    })
+}
+
+fn prelude_attribute_token(token: &proc_macro2::TokenTree) -> bool {
+    match token {
+        proc_macro2::TokenTree::Ident(ident) => ident == "no_std" || ident == "no_implicit_prelude",
+        proc_macro2::TokenTree::Group(group) => group
+            .stream()
+            .into_iter()
+            .any(|token| prelude_attribute_token(&token)),
+        _ => false,
+    }
+}
+
+/// Whether a trait among `items`, at any depth, declares a method with one of `names`, which
+/// the readings of standard method calls leave to the compiler.
+pub(crate) fn declares_trait_method(items: &[syn::Item], names: &[&str]) -> bool {
+    struct Search<'a>(&'a [&'a str], bool);
+    impl syn::visit::Visit<'_> for Search<'_> {
+        fn visit_trait_item_fn(&mut self, method: &syn::TraitItemFn) {
+            let name = ident_name(&method.sig.ident);
+            self.1 |= self.0.contains(&name.as_str());
+        }
+    }
+    let mut search = Search(names, false);
+    for item in items {
+        syn::visit::Visit::visit_item(&mut search, item);
+    }
+    search.1
+}
+
+/// Whether every `use` among `items`, at any depth, imports from `std`, `core` or `alloc`, so
+/// it brings no trait method beyond the standard library's into view.
+pub(crate) fn standard_imports(items: &[syn::Item]) -> bool {
+    struct Search(bool);
+    impl syn::visit::Visit<'_> for Search {
+        fn visit_item_use(&mut self, item: &syn::ItemUse) {
+            self.0 &= standard_tree(&item.tree);
+        }
+    }
+    fn standard_tree(tree: &syn::UseTree) -> bool {
+        match tree {
+            syn::UseTree::Path(path) => {
+                matches!(ident_name(&path.ident).as_str(), "std" | "core" | "alloc")
+            }
+            syn::UseTree::Group(group) => group.items.iter().all(standard_tree),
+            _ => false,
+        }
+    }
+    let mut search = Search(true);
+    for item in items {
+        syn::visit::Visit::visit_item(&mut search, item);
+    }
+    search.0
 }
 
 pub(crate) fn qualified_name(module: &[String], name: &str) -> String {

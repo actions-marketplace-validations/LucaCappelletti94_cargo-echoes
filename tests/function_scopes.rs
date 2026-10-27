@@ -742,3 +742,284 @@ fn an_observing_impl_retains_the_early_return() {
         view(&source("if p { x } else { 0u32 }"))
     );
 }
+
+#[test]
+fn split_arms_and_let_else_read_as_their_joined_forms_in_the_borrowed_view() {
+    for (written, joined) in [
+        (
+            "fn f(x: u32, y: u32) -> u32 { match x { 0 => y, 1 => y, _ => x } }",
+            "fn f(x: u32, y: u32) -> u32 { match x { 0 | 1 => y, _ => x } }",
+        ),
+        (
+            "fn f(o: Option<u32>) -> u32 { let Some(v) = o else { return 0; }; mark(v); v }",
+            "fn f(o: Option<u32>) -> u32 { match o { Some(v) => { mark(v); v } _ => { return 0; } } }",
+        ),
+    ] {
+        assert_eq!(view(written), view(joined), "{written}");
+    }
+}
+
+#[test]
+fn bound_arms_and_temporary_scrutinees_stay_apart_in_the_borrowed_view() {
+    assert_ne!(
+        view("fn f(t: (u32, u32)) -> u32 { match t { (a, 0) => a, (a, 1) => a, _ => 0 } }"),
+        view("fn f(t: (u32, u32)) -> u32 { match t { (a, 0) | (a, 1) => a, _ => 0 } }")
+    );
+    assert_ne!(
+        view("fn f() -> u32 { let Some(v) = make() else { return 0; }; v }"),
+        view("fn f() -> u32 { match make() { Some(v) => { v } _ => { return 0; } } }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_split_arms_and_let_else() {
+    assert_ne!(
+        failing_form("fn f(x: u32, y: u32) -> u32 { match x { 0 => y, 1 => y, _ => x } }"),
+        failing_form("fn f(x: u32, y: u32) -> u32 { match x { 0 | 1 => y, _ => x } }")
+    );
+    assert_ne!(
+        failing_form("fn f(o: Option<u32>) -> u32 { let Some(v) = o else { return 0; }; v }"),
+        failing_form(
+            "fn f(o: Option<u32>) -> u32 { match o { Some(v) => { v } _ => { return 0; } } }"
+        )
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_split_arms_and_let_else() {
+    let source = |body: &str| {
+        format!(
+            "struct S;\n#[observe]\nimpl S {{\n    fn f(o: Option<u32>, x: u32) -> u32 {{ {body} }}\n}}"
+        )
+    };
+    assert_ne!(
+        view(&source("match x { 0 => x, 1 => x, _ => 2u32 }")),
+        view(&source("match x { 0 | 1 => x, _ => 2u32 }"))
+    );
+    assert_ne!(
+        view(&source("let Some(v) = o else { return 0; }; v")),
+        view(&source("match o { Some(v) => { v } _ => { return 0; } } "))
+    );
+}
+
+#[test]
+fn owned_strings_and_empty_vectors_match_in_the_borrowed_view() {
+    for (written, canonical) in [
+        (
+            "fn f() -> String { \"a\".to_owned() }",
+            "fn f() -> String { String::from(\"a\") }",
+        ),
+        (
+            "fn f() -> Vec<u32> { vec![] }",
+            "fn f() -> Vec<u32> { Vec::new() }",
+        ),
+    ] {
+        assert_eq!(view(written), view(canonical), "{written}");
+    }
+}
+
+#[test]
+fn claimed_prelude_names_keep_the_spelling_in_the_borrowed_view() {
+    for prefix in ["#![no_std]", "use custom::ToOwned;", "use other::*;"] {
+        assert_ne!(
+            view(&format!("{prefix} fn f() -> String {{ \"a\".to_owned() }}")),
+            view(&format!(
+                "{prefix} fn f() -> String {{ \"a\".to_string() }}"
+            ))
+        );
+    }
+    assert_ne!(
+        view("struct Vec; impl Vec { fn new() -> Self { Vec } } fn f() -> Vec { Vec::new() }"),
+        view("struct Vec; impl Vec { fn new() -> Self { Vec } } fn f() -> Vec { vec![] }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_owned_string_spellings() {
+    assert_ne!(
+        failing_form("fn f() -> String { \"a\".to_owned() }"),
+        failing_form("fn f() -> String { \"a\".to_string() }")
+    );
+    assert_ne!(
+        failing_form("fn f() -> Vec<u32> { vec![] }"),
+        failing_form("fn f() -> Vec<u32> { Vec::new() }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_owned_string_spellings() {
+    let source = |body: &str| {
+        format!("struct S;\n#[observe]\nimpl S {{\n    fn f() -> String {{ {body} }}\n}}")
+    };
+    assert_ne!(
+        view(&source("\"a\".to_owned()")),
+        view(&source("\"a\".to_string()"))
+    );
+}
+
+#[test]
+fn widening_casts_match_conversions_in_the_borrowed_view() {
+    for (written, canonical) in [
+        (
+            "fn f(x: u32) -> u64 { x as u64 }",
+            "fn f(x: u32) -> u64 { u64::from(x) }",
+        ),
+        (
+            "fn f(x: u32) -> u32 { x as u32 }",
+            "fn f(x: u32) -> u32 { x }",
+        ),
+    ] {
+        assert_eq!(view(written), view(canonical), "{written}");
+    }
+}
+
+#[test]
+fn lossy_and_shadowed_conversions_stay_apart_in_the_borrowed_view() {
+    for (written, canonical) in [
+        (
+            "fn f(x: u32) -> u16 { x as u16 }",
+            "fn f(x: u32) -> u16 { u16::from(x) }",
+        ),
+        (
+            "use custom::u64; fn f(x: u32) -> u64 { x as u64 }",
+            "use custom::u64; fn f(x: u32) -> u64 { u64::from(x) }",
+        ),
+        (
+            "#![no_std] fn f(x: u32) -> u64 { x as u64 }",
+            "#![no_std] fn f(x: u32) -> u64 { u64::from(x) }",
+        ),
+    ] {
+        assert_ne!(view(written), view(canonical), "{written}");
+    }
+}
+
+#[test]
+fn the_failure_mode_retains_cast_spellings() {
+    assert_ne!(
+        failing_form("fn f(x: u32) -> u64 { x as u64 }"),
+        failing_form("fn f(x: u32) -> u64 { u64::from(x) }")
+    );
+    assert_ne!(
+        failing_form("fn f(x: u32) -> u32 { x as u32 }"),
+        failing_form("fn f(x: u32) -> u32 { x }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_cast_spellings() {
+    let source = |body: &str| {
+        format!("struct S;\n#[observe]\nimpl S {{\n    fn f(x: u32) -> u64 {{ {body} }}\n}}")
+    };
+    assert_ne!(view(&source("x as u64")), view(&source("u64::from(x)")));
+}
+
+#[test]
+fn bound_order_and_elidable_lifetimes_match_in_the_borrowed_view() {
+    for (written, canonical) in [
+        (
+            "fn f<T: Copy + Clone>(t: T) -> T { t }",
+            "fn f<T>(t: T) -> T where T: Clone + Copy { t }",
+        ),
+        (
+            "fn f<'a>(x: &'a u32) -> &'a u32 { x }",
+            "fn f(x: &u32) -> &u32 { x }",
+        ),
+    ] {
+        assert_eq!(view(written), view(canonical), "{written}");
+    }
+}
+
+#[test]
+fn shared_and_function_bound_signatures_stay_apart_in_the_borrowed_view() {
+    for (written, canonical) in [
+        (
+            "fn f<'a>(x: &'a u8, y: &'a u8) -> &'a u8 { x }",
+            "fn f(x: &u8, y: &u8) -> &u8 { x }",
+        ),
+        (
+            "fn f<F: Fn() + Clone>(g: F) {}",
+            "fn f<F: Clone + Fn()>(g: F) {}",
+        ),
+    ] {
+        assert_ne!(view(written), view(canonical), "{written}");
+    }
+}
+
+#[test]
+fn the_failure_mode_retains_bound_order_and_lifetimes() {
+    assert_ne!(
+        failing_form("fn f<T: Copy + Clone>(t: T) -> T { t }"),
+        failing_form("fn f<T: Clone + Copy>(t: T) -> T { t }")
+    );
+    assert_ne!(
+        failing_form("fn f<'a>(x: &'a u32) -> &'a u32 { x }"),
+        failing_form("fn f(x: &u32) -> &u32 { x }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_bound_order_and_lifetimes() {
+    let source = |method: &str| format!("struct S;\n#[observe]\nimpl S {{\n    {method}\n}}");
+    assert_ne!(
+        view(&source("fn f<T: Copy + Clone>(t: T) -> T { t }")),
+        view(&source("fn f<T: Clone + Copy>(t: T) -> T { t }"))
+    );
+    assert_ne!(
+        view(&source("fn f<'a>(x: &'a u32) -> &'a u32 { x }")),
+        view(&source("fn f(x: &u32) -> &u32 { x }"))
+    );
+}
+
+#[test]
+fn primitive_copies_reduce_in_the_borrowed_view() {
+    for (written, canonical) in [
+        (
+            "fn f(x: u32) -> u32 { x.clone() }",
+            "fn f(x: u32) -> u32 { x }",
+        ),
+        ("fn f(x: u32) -> u32 { *&x }", "fn f(x: u32) -> u32 { x }"),
+        (
+            "fn f(x: u32, y: u32) -> bool { &x == &y }",
+            "fn f(x: u32, y: u32) -> bool { x == y }",
+        ),
+    ] {
+        assert_eq!(view(written), view(canonical), "{written}");
+    }
+}
+
+#[test]
+fn foreign_imports_and_values_keep_their_copies_in_the_borrowed_view() {
+    for (written, canonical) in [
+        (
+            "use other::Dup; fn f(x: u32) -> u32 { x.clone() }",
+            "use other::Dup; fn f(x: u32) -> u32 { x }",
+        ),
+        (
+            "fn f(s: String) -> String { s.clone() }",
+            "fn f(s: String) -> String { s }",
+        ),
+    ] {
+        assert_ne!(view(written), view(canonical), "{written}");
+    }
+}
+
+#[test]
+fn the_failure_mode_retains_primitive_copies() {
+    assert_ne!(
+        failing_form("fn f(x: u32) -> u32 { x.clone() }"),
+        failing_form("fn f(x: u32) -> u32 { x }")
+    );
+    assert_ne!(
+        failing_form("fn f(x: u32) -> u32 { *&x }"),
+        failing_form("fn f(x: u32) -> u32 { x }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_primitive_copies() {
+    let source = |body: &str| {
+        format!("struct S;\n#[observe]\nimpl S {{\n    fn f(x: u32) -> u32 {{ {body} }}\n}}")
+    };
+    assert_ne!(view(&source("x.clone()")), view(&source("x")));
+    assert_ne!(view(&source("*&x")), view(&source("x")));
+}
