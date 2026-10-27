@@ -9,7 +9,9 @@ use syn::visit::{self, Visit};
 use syn::visit_mut::{self, VisitMut};
 
 use crate::alpha::{Env, Renamer};
-use crate::schedule::{self, BitwiseOp, BlockFacts, Equality, Lbl, Port, TotalBinary, Value};
+use crate::schedule::{
+    self, BitwiseOp, BlockFacts, Equality, Identity, Lbl, Port, TotalBinary, Value,
+};
 use crate::scope::PrimTy;
 
 struct Bound {
@@ -152,6 +154,21 @@ fn tail_expr_mut(block: &mut syn::Block) -> Option<&mut syn::Expr> {
     Some(expr)
 }
 
+/// Whether two optional `else` branches are both absent or spell the same tokens.
+fn same_branch(
+    left: Option<&(syn::token::Else, Box<syn::Expr>)>,
+    right: Option<&(syn::token::Else, Box<syn::Expr>)>,
+) -> bool {
+    use quote::ToTokens as _;
+    match (left, right) {
+        (None, None) => true,
+        (Some((_, left)), Some((_, right))) => {
+            left.to_token_stream().to_string() == right.to_token_stream().to_string()
+        }
+        _ => false,
+    }
+}
+
 /// The name of a binding `expr` reads by one unattributed identifier, the only place a compound
 /// assignment expands without reading a field, an index or a dereference twice.
 fn local_name(expr: &syn::Expr) -> Option<String> {
@@ -193,6 +210,8 @@ impl Walker<'_, '_> {
                             | syn::BinOp::BitXor(_)
                             | syn::BinOp::And(_)
                             | syn::BinOp::Or(_)
+                            | syn::BinOp::Add(_)
+                            | syn::BinOp::Mul(_)
                     ));
         let left = self.scalar_in_place(&mut binary.left, total_calls);
         let right = self.scalar_in_place(&mut binary.right, total_calls);
@@ -219,6 +238,16 @@ impl Walker<'_, '_> {
             };
             return (syn::Expr::Assign(assign), None);
         }
+        self.labeled_binary(binary, left, right)
+    }
+
+    /// The reduction of a binary operation whose operands both carry labels.
+    fn labeled_binary(
+        &self,
+        mut binary: syn::ExprBinary,
+        left: Lbl,
+        right: Lbl,
+    ) -> (syn::Expr, Option<Lbl>) {
         if self.dedup
             && let Some(equality) = schedule::equality(binary.op, &left, &right)
         {
@@ -250,6 +279,16 @@ impl Walker<'_, '_> {
             );
             return (expr, Some(label));
         }
+        if self.dedup
+            && let Some(identity) = schedule::arithmetic_identity(binary.op, &left, &right)
+        {
+            let expr = match identity {
+                Identity::Left => *binary.left,
+                Identity::Right => *binary.right,
+                Identity::Zero(prim) => crate::constants::literal_expr(prim, 0, binary.span()),
+            };
+            return (expr, Some(schedule::identity_label(identity, left, right)));
+        }
         match schedule::total_binary(binary.op, &left, &right) {
             Some(TotalBinary::Flat(op, prim)) => {
                 let (expr, label) = self.flat(binary, op, prim, left, right);
@@ -268,7 +307,12 @@ impl Walker<'_, '_> {
                     Some(Lbl::Op(tag, Box::new(left), Box::new(right), prim)),
                 )
             }
-            None => (syn::Expr::Binary(binary), None),
+            None => {
+                if schedule::commutative_operands(binary.op, &left, &right) && right < left {
+                    core::mem::swap(&mut binary.left, &mut binary.right);
+                }
+                (syn::Expr::Binary(binary), None)
+            }
         }
     }
 
@@ -300,9 +344,8 @@ impl Walker<'_, '_> {
                 self.branch(conditional(r#match), total_calls)
             }
             syn::Expr::Group(group) => self.scalar(*group.expr, total_calls),
-            syn::Expr::MethodCall(mut method) if self.native_wrapping_add(&method) => {
-                let label = self.wrapping_add(&mut method);
-                (syn::Expr::MethodCall(method), label)
+            syn::Expr::MethodCall(method) if self.native_commutative(&method) => {
+                self.commutative(method)
             }
             expr @ syn::Expr::Call(_) if total_calls => {
                 let mut locals = 0;
@@ -340,14 +383,15 @@ impl Walker<'_, '_> {
             }
         }
         fold_literals(op, prim, &mut pieces, span);
-        if self.dedup && op == BitwiseOp::Xor {
-            pieces.retain(|piece| piece.0.literal_bits() != Some(0));
-            if pieces.is_empty() {
-                return (
-                    crate::constants::literal_expr(prim, 0, span),
-                    schedule::literal_label(prim, 0),
-                );
-            }
+        if self.dedup
+            && let Some(value) = schedule::reduce_literal_leaves(op, prim, &mut pieces, |piece| {
+                piece.0.literal_bits()
+            })
+        {
+            return (
+                crate::constants::literal_expr(prim, value, span),
+                schedule::literal_label(prim, value),
+            );
         }
         if pieces.len() == 1 {
             let (label, expr) = pieces.pop().expect("a single operand");
@@ -407,7 +451,63 @@ impl Walker<'_, '_> {
         self.scalar_in_place(expr, total_calls)
     }
 
-    fn branch(&self, mut branch: syn::ExprIf, total_calls: bool) -> (syn::Expr, Option<Lbl>) {
+    /// Merge `if p { if q { a } else { b } } else { b }` into `if p && q { a } else { b }`, and
+    /// `if p { if q { a } }` into `if p && q { a }`, while the outer `then` block holds only the
+    /// inner `if`, both `else` branches are the same tokens and both conditions are proven
+    /// total booleans, which `&&` evaluates in the same situations. The outer `if` arrives
+    /// unattributed, since `scalar` keeps attributed expressions as written.
+    fn collapse(&self, mut branch: syn::ExprIf, total_calls: bool) -> syn::ExprIf {
+        loop {
+            let last = branch.then_branch.stmts.pop();
+            let inner = match (last, branch.then_branch.stmts.is_empty()) {
+                (Some(syn::Stmt::Expr(syn::Expr::If(inner), None)), true) => inner,
+                (Some(syn::Stmt::Expr(syn::Expr::Match(inner), None)), true)
+                    if self.boolean_match(&inner) =>
+                {
+                    conditional(inner)
+                }
+                (last, _) => {
+                    branch.then_branch.stmts.extend(last);
+                    return branch;
+                }
+            };
+            let conditions = if inner.attrs.is_empty()
+                && same_branch(branch.else_branch.as_ref(), inner.else_branch.as_ref())
+            {
+                self.proven_conditions(&branch.cond, &inner.cond, total_calls)
+            } else {
+                None
+            };
+            let Some(((outer, outer_label), (nested, nested_label))) = conditions else {
+                branch
+                    .then_branch
+                    .stmts
+                    .push(syn::Stmt::Expr(syn::Expr::If(inner), None));
+                return branch;
+            };
+            let (cond, _) = logical('∧', (outer, outer_label), (nested, nested_label), true);
+            *branch.cond = cond;
+            branch.then_branch = inner.then_branch;
+        }
+    }
+
+    /// The normalized outer and inner conditions with their labels, when both are proven total
+    /// booleans.
+    fn proven_conditions(
+        &self,
+        outer: &syn::Expr,
+        inner: &syn::Expr,
+        total_calls: bool,
+    ) -> Option<((syn::Expr, Lbl), (syn::Expr, Lbl))> {
+        let (outer, outer_label) = self.scalar(outer.clone(), total_calls);
+        let (inner, inner_label) = self.scalar(inner.clone(), total_calls);
+        let (outer_label, inner_label) = (outer_label?, inner_label?);
+        (outer_label.prim() == Some(PrimTy::Bool) && inner_label.prim() == Some(PrimTy::Bool))
+            .then_some(((outer, outer_label), (inner, inner_label)))
+    }
+
+    fn branch(&self, branch: syn::ExprIf, total_calls: bool) -> (syn::Expr, Option<Lbl>) {
+        let mut branch = self.collapse(branch, total_calls);
         let Some((_, otherwise)) = &mut branch.else_branch else {
             self.scalar_in_place(&mut branch.cond, total_calls);
             return (syn::Expr::If(branch), None);
@@ -490,10 +590,10 @@ impl Walker<'_, '_> {
         }
     }
 
-    /// Whether `method` is `wrapping_add` on a proven fixed-width integer receiver,
-    /// which inherent resolution binds to the native by-value method.
-    fn native_wrapping_add(&self, method: &syn::ExprMethodCall) -> bool {
-        if !schedule::wrapping_add_shape(method) {
+    /// Whether `method` is a commutative inherent method on a proven fixed-width integer
+    /// receiver, which inherent resolution binds to the native by-value method.
+    fn native_commutative(&self, method: &syn::ExprMethodCall) -> bool {
+        if schedule::commutative_method(method).is_none() {
             return false;
         }
         let mut locals = 0;
@@ -508,17 +608,32 @@ impl Walker<'_, '_> {
         matches!(receiver.prim(), Some(PrimTy::Int { .. }))
     }
 
-    /// The label of a native `wrapping_add`, its operands put in label order,
-    /// a literal whose type the receiver infers staying the argument.
-    fn wrapping_add(&self, method: &mut syn::ExprMethodCall) -> Option<Lbl> {
+    /// The value of a native commutative method call: its operands put in label order, a
+    /// literal whose type the receiver infers staying the argument, or the other operand when
+    /// one operand is the method's identity.
+    fn commutative(&self, mut method: syn::ExprMethodCall) -> (syn::Expr, Option<Lbl>) {
+        let tag = schedule::commutative_method(&method).expect("a native commutative method");
         let receiver = self.scalar_in_place(&mut method.receiver, true);
         let argument = self.scalar_in_place(&mut method.args[0], true);
-        let (receiver, argument) = (receiver?, argument?);
-        let prim = schedule::wrapping_add_prim(&receiver, &argument)?;
+        let (Some(receiver), Some(argument)) = (receiver, argument) else {
+            return (syn::Expr::MethodCall(method), None);
+        };
+        let Some(prim) = schedule::commutative_prim(tag, &receiver, &argument) else {
+            return (syn::Expr::MethodCall(method), None);
+        };
+        let unit = schedule::method_identity(tag);
+        if self.dedup && unit.is_some() && argument.literal_bits() == unit {
+            return (*method.receiver, Some(receiver));
+        }
+        if self.dedup && unit.is_some() && receiver.literal_bits() == unit {
+            let argument_expr = method.args.pop().expect("one argument");
+            return (argument_expr, Some(argument));
+        }
         if argument < receiver && argument.prim().is_some() {
             core::mem::swap(&mut *method.receiver, &mut method.args[0]);
         }
-        Some(schedule::wrapping_add_label(prim, receiver, argument))
+        let label = schedule::commutative_label(tag, prim, receiver, argument);
+        (syn::Expr::MethodCall(method), Some(label))
     }
 
     /// Whether `r#match` is a boolean match its conditional form proves.
@@ -600,8 +715,9 @@ impl VisitMut for Walker<'_, '_> {
                 self.visit_expr_mut(&mut raw.expr);
                 self.dedup = dedup;
             }
-            syn::Expr::MethodCall(method) if self.native_wrapping_add(method) => {
-                self.wrapping_add(method);
+            syn::Expr::MethodCall(method) if self.native_commutative(method) => {
+                let owned = core::mem::replace(expr, empty_expr());
+                *expr = self.scalar(owned, false).0;
             }
             syn::Expr::MethodCall(method) => {
                 let dedup = core::mem::replace(&mut self.dedup, false);

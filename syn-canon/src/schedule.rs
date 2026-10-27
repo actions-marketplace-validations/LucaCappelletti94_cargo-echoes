@@ -117,8 +117,8 @@ pub(crate) enum Lbl {
     /// A total bitwise or valid shift over proven scalars.
     Op(char, Box<Lbl>, Box<Lbl>, PrimTy),
     /// A flattened bitwise chain: one operator and type, sorted leaves,
-    /// multiplicity retained, literal leaves folded. The `WRAPPING_ADD`
-    /// tag holds the sorted operand pair of one native integer call.
+    /// multiplicity retained, literal leaves folded. The tags of
+    /// `COMMUTATIVE_METHODS` hold the sorted operand pair of one native integer call.
     Flat(char, Vec<Lbl>, PrimTy),
     /// Any other expression, by a kind tag and its ordered children.
     Other(String, Vec<Lbl>),
@@ -862,11 +862,8 @@ pub(crate) fn flat_label(op: BitwiseOp, prim: PrimTy, mut leaves: Vec<Lbl>) -> L
         leaves.dedup();
     }
     fold_literal_leaves(op, prim, &mut leaves);
-    if op == BitwiseOp::Xor {
-        leaves.retain(|leaf| leaf.literal_bits() != Some(0));
-        if leaves.is_empty() {
-            return literal_label(prim, 0);
-        }
+    if let Some(value) = reduce_literal_leaves(op, prim, &mut leaves, Lbl::literal_bits) {
+        return literal_label(prim, value);
     }
     if leaves.len() == 1 {
         match leaves.pop().expect("a single operand") {
@@ -875,6 +872,99 @@ pub(crate) fn flat_label(op: BitwiseOp, prim: PrimTy, mut leaves: Vec<Lbl>) -> L
         }
     } else {
         Lbl::Flat(op.tag(), leaves, prim)
+    }
+}
+
+/// Every bit of `prim` set: the all-ones value of a fixed-width integer, `true` for `bool`.
+pub(crate) fn all_ones(prim: PrimTy) -> u128 {
+    match prim {
+        PrimTy::Int { width, .. } => u128::MAX >> (128 - width.bits()),
+        PrimTy::Bool => 1,
+    }
+}
+
+/// Remove a chain's identity literal, `0` for `|` and `^` and all ones for `&`, from its
+/// sorted, folded operands. The chain's value instead, when an absorbing literal decides it
+/// (`0` for `&`, all ones for `|`) or no operand is left.
+pub(crate) fn reduce_literal_leaves<T>(
+    op: BitwiseOp,
+    prim: PrimTy,
+    leaves: &mut Vec<T>,
+    bits: impl Fn(&T) -> Option<u128>,
+) -> Option<u128> {
+    let (identity, absorbing) = match op {
+        BitwiseOp::Xor => (0, None),
+        BitwiseOp::Or => (0, Some(all_ones(prim))),
+        BitwiseOp::And => (all_ones(prim), Some(0)),
+    };
+    if let Some(absorbing) = absorbing
+        && leaves.iter().any(|leaf| bits(leaf) == Some(absorbing))
+    {
+        return Some(absorbing);
+    }
+    leaves.retain(|leaf| bits(leaf) != Some(identity));
+    leaves.is_empty().then_some(identity)
+}
+
+/// How a checked arithmetic operation with an identity or absorbing operand reduces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Identity {
+    /// The value is the left operand.
+    Left,
+    /// The value is the right operand.
+    Right,
+    /// The value is zero of the operands' type.
+    Zero(PrimTy),
+}
+
+/// The reduction of `+`, `-`, `*`, `/`, `<<` or `>>` over proven fixed-width integers whose
+/// identity or absorbing operand leaves no overflow, division or shift to check: `x + 0`,
+/// `x - 0`, `x * 1`, `x / 1` and a shift by zero give `x`, and `x * 0` and `x - x` give zero.
+pub(crate) fn arithmetic_identity(op: syn::BinOp, left: &Lbl, right: &Lbl) -> Option<Identity> {
+    let is = |label: &Lbl, value: u128| label.literal_bits() == Some(value);
+    if matches!(op, syn::BinOp::Shl(_) | syn::BinOp::Shr(_)) {
+        return (matches!(left.prim(), Some(PrimTy::Int { .. }))
+            && matches!(right, Lbl::Int(0, _)))
+        .then_some(Identity::Left);
+    }
+    let prim @ PrimTy::Int { .. } = scalar_prim(left, right)? else {
+        return None;
+    };
+    let identity = match op {
+        syn::BinOp::Add(_) | syn::BinOp::Sub(_) => 0,
+        syn::BinOp::Mul(_) | syn::BinOp::Div(_) => 1,
+        _ => return None,
+    };
+    let commutes = matches!(op, syn::BinOp::Add(_) | syn::BinOp::Mul(_));
+    if is(right, identity) {
+        Some(Identity::Left)
+    } else if commutes && is(left, identity) {
+        Some(Identity::Right)
+    } else if matches!(op, syn::BinOp::Sub(_)) && left == right
+        || matches!(op, syn::BinOp::Mul(_)) && (is(left, 0) || is(right, 0))
+    {
+        Some(Identity::Zero(prim))
+    } else {
+        None
+    }
+}
+
+/// The label an arithmetic identity leaves.
+pub(crate) fn identity_label(identity: Identity, left: Lbl, right: Lbl) -> Lbl {
+    match identity {
+        Identity::Left => left,
+        Identity::Right => right,
+        Identity::Zero(prim) => literal_label(prim, 0),
+    }
+}
+
+/// The identity operand of the native commutative method `tag`: `0` for the additions and
+/// `1` for the multiplications.
+pub(crate) fn method_identity(tag: char) -> Option<u128> {
+    match tag {
+        '⊞' | '⊕' => Some(0),
+        '⊠' | '⊗' => Some(1),
+        _ => None,
     }
 }
 
@@ -987,12 +1077,22 @@ fn label_lit(lit: &syn::Lit) -> Lbl {
         syn::Lit::Int(integer) => {
             let prim = crate::scope::primitive_suffix(integer.suffix());
             match integer.base10_parse::<u128>() {
-                Ok(value) => Lbl::Int(value, prim),
-                Err(_) => Lbl::Lit(integer.to_token_stream().to_string()),
+                Ok(value) if prim.is_none_or(|prim| value <= largest(prim)) => {
+                    Lbl::Int(value, prim)
+                }
+                _ => Lbl::Lit(integer.to_token_stream().to_string()),
             }
         }
         syn::Lit::Bool(boolean) => Lbl::Bool(boolean.value),
         other => Lbl::Lit(other.to_token_stream().to_string()),
+    }
+}
+
+/// The largest value a non-negative literal of `prim` may spell.
+fn largest(prim: PrimTy) -> u128 {
+    match prim {
+        PrimTy::Int { signed: true, .. } => all_ones(prim) >> 1,
+        prim => all_ones(prim),
     }
 }
 
@@ -1284,6 +1384,10 @@ fn label_binary(
         && let Some(reduced) = equality_label(bin.op, &left, &right)
     {
         reduced
+    } else if bin.attrs.is_empty()
+        && let Some(identity) = arithmetic_identity(bin.op, &left, &right)
+    {
+        identity_label(identity, left, right)
     } else {
         match total_binary(bin.op, &left, &right) {
             Some(TotalBinary::Ordered {
@@ -1313,7 +1417,12 @@ fn label_binary(
                 } else {
                     op_text(bin.op)
                 };
-                Lbl::Other(tag, vec![left, right])
+                let mut operands = vec![left, right];
+                if bin.attrs.is_empty() && commutative_operands(bin.op, &operands[0], &operands[1])
+                {
+                    operands.sort();
+                }
+                Lbl::Other(tag, operands)
             }
         }
     };
@@ -1322,6 +1431,13 @@ fn label_binary(
         value_sites(&label, &mut sites);
     }
     (label, sites)
+}
+
+/// Whether `op` is `+` or `*` over two proven operands of one fixed-width integer type, whose
+/// order changes neither the value nor whether the operation overflows.
+pub(crate) fn commutative_operands(op: syn::BinOp, left: &Lbl, right: &Lbl) -> bool {
+    matches!(op, syn::BinOp::Add(_) | syn::BinOp::Mul(_))
+        && matches!(scalar_prim(left, right), Some(PrimTy::Int { .. }))
 }
 
 fn value_sites(label: &Lbl, sites: &mut Vec<Site>) {
@@ -1421,7 +1537,7 @@ fn total_helper(
 }
 
 /// The label of a method call, the receiver's sites marked on its storage,
-/// its arguments in operand order. A native integer `wrapping_add` over
+/// its arguments in operand order. A native commutative integer method over
 /// total operands reads both by value as an unordered pair.
 fn label_method(
     renamer: &Renamer,
@@ -1447,13 +1563,17 @@ fn label_method(
         children.push(label);
         sites.extend(a_sites);
     }
-    if wrapping_add_shape(method)
+    if let Some(tag) = commutative_method(method)
         && let [receiver, argument] = children.as_slice()
-        && let Some(prim) = wrapping_add_prim(receiver, argument)
+        && let Some(prim) = commutative_prim(tag, receiver, argument)
     {
-        let argument = children.pop().expect("a wrapping argument");
-        let receiver = children.pop().expect("a wrapping receiver");
-        let label = wrapping_add_label(prim, receiver, argument);
+        let argument = children.pop().expect("a commutative argument");
+        let receiver = children.pop().expect("a commutative receiver");
+        let label = match method_identity(tag) {
+            Some(unit) if argument.literal_bits() == Some(unit) => receiver,
+            Some(unit) if receiver.literal_bits() == Some(unit) => argument,
+            _ => commutative_label(tag, prim, receiver, argument),
+        };
         sites.clear();
         value_sites(&label, &mut sites);
         return (label, sites);
@@ -1462,31 +1582,54 @@ fn label_method(
     (Lbl::Other("m".into(), children), sites)
 }
 
-/// The `Flat` tag of a native integer `wrapping_add`.
-const WRAPPING_ADD: char = '⊞';
+/// The commutative inherent integer methods, each with the `Flat` tag of its unordered
+/// operand pair.
+const COMMUTATIVE_METHODS: [(&str, char); 5] = [
+    ("wrapping_add", '⊞'),
+    ("wrapping_mul", '⊠'),
+    ("saturating_add", '⊕'),
+    ("saturating_mul", '⊗'),
+    ("abs_diff", '⊖'),
+];
 
-/// An unattributed one-argument `wrapping_add` call without turbofish.
-pub(crate) fn wrapping_add_shape(method: &syn::ExprMethodCall) -> bool {
-    method.attrs.is_empty()
-        && method.turbofish.is_none()
-        && method.args.len() == 1
-        && method.method == "wrapping_add"
+/// The `Flat` tag of an unattributed one-argument call without turbofish to a commutative
+/// inherent integer method name.
+pub(crate) fn commutative_method(method: &syn::ExprMethodCall) -> Option<char> {
+    if !method.attrs.is_empty() || method.turbofish.is_some() || method.args.len() != 1 {
+        return None;
+    }
+    COMMUTATIVE_METHODS
+        .iter()
+        .find(|(name, _)| method.method == name)
+        .map(|&(_, tag)| tag)
 }
 
-/// The fixed-width integer type of a native `wrapping_add`: a proven receiver
-/// type, whose inherent method resolution precedes every trait method, and an
-/// argument of that type.
-pub(crate) fn wrapping_add_prim(receiver: &Lbl, argument: &Lbl) -> Option<PrimTy> {
+/// The result type of the native method `tag` names: a proven fixed-width integer receiver,
+/// whose inherent method resolution precedes every trait method, and an argument of that
+/// type. `abs_diff` returns the unsigned type of the same width.
+pub(crate) fn commutative_prim(tag: char, receiver: &Lbl, argument: &Lbl) -> Option<PrimTy> {
     let prim = receiver.prim()?;
-    (matches!(prim, PrimTy::Int { .. }) && scalar_prim(receiver, argument) == Some(prim))
-        .then_some(prim)
+    let PrimTy::Int { width, .. } = prim else {
+        return None;
+    };
+    if scalar_prim(receiver, argument) != Some(prim) {
+        return None;
+    }
+    Some(if tag == '⊖' {
+        PrimTy::Int {
+            width,
+            signed: false,
+        }
+    } else {
+        prim
+    })
 }
 
-/// The unordered operand pair of a native `wrapping_add`.
-pub(crate) fn wrapping_add_label(prim: PrimTy, receiver: Lbl, argument: Lbl) -> Lbl {
+/// The unordered operand pair of a native commutative method call.
+pub(crate) fn commutative_label(tag: char, prim: PrimTy, receiver: Lbl, argument: Lbl) -> Lbl {
     let mut operands = vec![receiver, argument];
     operands.sort();
-    Lbl::Flat(WRAPPING_ADD, operands, prim)
+    Lbl::Flat(tag, operands, prim)
 }
 
 /// The label of a reference, its inner sites marked on the referenced
@@ -1963,7 +2106,8 @@ fn label_match_expr(
 }
 
 /// The scrutinee and the `true` and `false` arm bodies of an unattributed,
-/// exhaustive two-arm match over literal boolean patterns.
+/// exhaustive two-arm match over unguarded boolean patterns: two different
+/// literals, or a literal followed by `_` for the other value.
 pub(crate) fn boolean_match(
     r#match: &syn::ExprMatch,
 ) -> Option<(&syn::Expr, &syn::Expr, &syn::Expr)> {
@@ -1973,14 +2117,21 @@ pub(crate) fn boolean_match(
     if !r#match.attrs.is_empty() {
         return None;
     }
-    let value = |arm: &syn::Arm| match &arm.pat {
-        syn::Pat::Lit(syn::ExprLit {
-            attrs,
-            lit: syn::Lit::Bool(literal),
-        }) if attrs.is_empty() && arm.attrs.is_empty() => Some(literal.value),
-        _ => None,
+    let pattern = |arm: &syn::Arm| {
+        if !arm.attrs.is_empty() {
+            return None;
+        }
+        match &arm.pat {
+            syn::Pat::Lit(syn::ExprLit {
+                attrs,
+                lit: syn::Lit::Bool(literal),
+            }) if attrs.is_empty() => Some(Some(literal.value)),
+            syn::Pat::Wild(wild) if wild.attrs.is_empty() => Some(None),
+            _ => None,
+        }
     };
-    let (selected, other) = (value(first)?, value(second)?);
+    let selected = pattern(first)??;
+    let other = pattern(second)?.unwrap_or(!selected);
     if selected == other {
         return None;
     }

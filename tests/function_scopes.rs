@@ -557,3 +557,188 @@ fn an_observing_impl_retains_the_let_annotation() {
         view(&source("let v = 5u32; v"))
     );
 }
+
+#[test]
+fn proven_commutative_operands_take_one_order_in_the_borrowed_view() {
+    let body = |expression: &str| format!("fn f(x: u32, y: u32) -> u32 {{ {expression} }}");
+    for (written, reordered) in [
+        ("x + y", "y + x"),
+        ("x.saturating_mul(y)", "y.saturating_mul(x)"),
+        ("read(); x * y", "read(); y * x"),
+    ] {
+        assert_eq!(view(&body(written)), view(&body(reordered)), "{written}");
+    }
+}
+
+#[test]
+fn unproven_commutative_operands_keep_their_order_in_the_borrowed_view() {
+    assert_ne!(
+        view("fn f(x: u32, y: Unknown) -> u32 { (x + y) ^ x }"),
+        view("fn f(x: u32, y: Unknown) -> u32 { (y + x) ^ x }")
+    );
+    assert_ne!(
+        view("fn f(x: u32) -> u32 { read() + x }"),
+        view("fn f(x: u32) -> u32 { x + read() }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_the_commutative_operand_order() {
+    assert_ne!(
+        failing_form("fn f(x: u32, y: u32) -> u32 { y + x }"),
+        failing_form("fn f(x: u32, y: u32) -> u32 { x + y }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_the_commutative_operand_order() {
+    let source = |body: &str| {
+        format!(
+            "struct S;\n#[observe]\nimpl S {{\n    fn f(x: u32, y: u32) -> u32 {{ {body} }}\n}}"
+        )
+    };
+    assert_ne!(view(&source("y * x")), view(&source("x * y")));
+}
+
+#[test]
+fn proven_identities_reduce_in_the_borrowed_view() {
+    let body = |expression: &str| format!("fn f(x: u32, y: u32) -> u32 {{ {expression} }}");
+    for (written, reduced) in [
+        ("(x + 0) ^ y", "x ^ y"),
+        ("x.wrapping_mul(1) | (y & 0)", "x"),
+        ("read(); x - x", "read(); 0u32"),
+    ] {
+        assert_eq!(view(&body(written)), view(&body(reduced)), "{written}");
+    }
+}
+
+#[test]
+fn unproven_identities_stay_in_the_borrowed_view() {
+    assert_ne!(
+        view("fn f(x: Unknown) -> Unknown { x + 0 }"),
+        view("fn f(x: Unknown) -> Unknown { x }")
+    );
+    assert_ne!(
+        view("fn f() -> u32 { read() * 0 }"),
+        view("fn f() -> u32 { 0u32 }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_the_identity_operand() {
+    assert_ne!(
+        failing_form("fn f(x: u32) -> u32 { x | 0 }"),
+        failing_form("fn f(x: u32) -> u32 { x }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_the_identity_operand() {
+    let source = |body: &str| {
+        format!("struct S;\n#[observe]\nimpl S {{\n    fn f(x: u32) -> u32 {{ {body} }}\n}}")
+    };
+    assert_ne!(view(&source("x * 1")), view(&source("x")));
+}
+
+#[test]
+fn nested_conditionals_merge_in_the_borrowed_view() {
+    let body =
+        |statements: &str| format!("fn f(p: bool, q: bool, x: u32) -> u32 {{ {statements} }}");
+    for (written, merged) in [
+        ("if p { if q { mark(); } } x", "if p && q { mark(); } x"),
+        (
+            "if p { if q { x } else { read() } } else { read() }",
+            "if q && p { x } else { read() }",
+        ),
+        (
+            "match p { false => 0u32, _ => x }",
+            "if p { x } else { 0u32 }",
+        ),
+    ] {
+        assert_eq!(view(&body(written)), view(&body(merged)), "{written}");
+    }
+}
+
+#[test]
+fn unproven_nested_conditionals_stay_nested_in_the_borrowed_view() {
+    assert_ne!(
+        view("fn f(p: Unknown, q: bool) { if p { if q { mark(); } } }"),
+        view("fn f(p: Unknown, q: bool) { if p && q { mark(); } }")
+    );
+    assert_ne!(
+        view(
+            "fn f(p: bool, q: bool, x: u32) -> u32 { if p { if q { x } else { 1u32 } } else { 2u32 } }"
+        ),
+        view("fn f(p: bool, q: bool, x: u32) -> u32 { if p && q { x } else { 2u32 } }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_the_nested_conditional() {
+    assert_ne!(
+        failing_form("fn f(p: bool, q: bool) { if p { if q { mark(); } } }"),
+        failing_form("fn f(p: bool, q: bool) { if p && q { mark(); } }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_the_nested_conditional() {
+    let source = |body: &str| {
+        format!("struct S;\n#[observe]\nimpl S {{\n    fn f(p: bool, q: bool) {{ {body} }}\n}}")
+    };
+    assert_ne!(
+        view(&source("if p { if q { mark(); } }")),
+        view(&source("if p && q { mark(); }"))
+    );
+}
+
+#[test]
+fn early_returns_read_as_else_branches_in_the_borrowed_view() {
+    let body =
+        |statements: &str| format!("fn f(p: bool, q: bool, x: u32) -> u32 {{ {statements} }}");
+    for (written, branched) in [
+        (
+            "if p { mark(); return x; } 0u32",
+            "if p { mark(); x } else { 0u32 }",
+        ),
+        (
+            "if p { return x; } if q { return 1u32; } 0u32",
+            "if p { x } else if q { 1u32 } else { 0u32 }",
+        ),
+    ] {
+        assert_eq!(view(&body(written)), view(&body(branched)), "{written}");
+    }
+}
+
+#[test]
+fn unproven_early_returns_keep_the_return_in_the_borrowed_view() {
+    assert_ne!(
+        view("fn f(p: Unknown, x: u32) -> u32 { if p { return x; } 0u32 }"),
+        view("fn f(p: Unknown, x: u32) -> u32 { if p { x } else { 0u32 } }")
+    );
+    assert_ne!(
+        view("fn f(p: bool, x: u32) -> u32 { if p { return x; } read() }"),
+        view("fn f(p: bool, x: u32) -> u32 { if p { x } else { read() } }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_the_early_return() {
+    assert_ne!(
+        failing_form("fn f(p: bool, x: u32) -> u32 { if p { return x; } 0u32 }"),
+        failing_form("fn f(p: bool, x: u32) -> u32 { if p { x } else { 0u32 } }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_the_early_return() {
+    let source = |body: &str| {
+        format!(
+            "struct S;\n#[observe]\nimpl S {{\n    fn f(p: bool, x: u32) -> u32 {{ {body} }}\n}}"
+        )
+    };
+    assert_ne!(
+        view(&source("if p { return x; } 0u32")),
+        view(&source("if p { x } else { 0u32 }"))
+    );
+}

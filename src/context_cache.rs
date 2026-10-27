@@ -165,6 +165,19 @@ pub mod alpha {
         let start: u32 = 1;
         start
     }
+    pub fn scaled(value: u32, other: u32) -> u32 {
+        other.saturating_mul(value) * value
+    }
+    pub fn padded(value: u32) -> u32 {
+        (value | 0) * 1
+    }
+    pub fn armed(flag: bool, other: bool) -> u32 {
+        if flag { if other { 1u32 } else { 0u32 } } else { 0u32 }
+    }
+    pub fn guarded(flag: bool, value: u32) -> u32 {
+        if flag { return value; }
+        0u32
+    }
 }
 mod custom {
     macro_rules! vec {

@@ -921,13 +921,14 @@ const BOOLEAN_MATCH_FIXTURE: &str = "tests/fixtures/boolmatchws";
 fn boolean_match_doctests_group_only_the_proven_conditional_forms() {
     let report = Echoes::default().run(BOOLEAN_MATCH_FIXTURE).unwrap();
     assert_eq!(report.total, 8);
-    assert_eq!(report.unique, 6);
+    assert_eq!(report.unique, 5);
     assert_eq!(
         doctest_groups(&report),
         [vec![
             "boolmatchws::Conditional",
             "boolmatchws::Matched",
             "boolmatchws::Reversed",
+            "boolmatchws::Wildcard",
         ]]
     );
     let group = &report.groups[0];
@@ -944,11 +945,12 @@ fn boolean_match_doctests_group_only_the_proven_conditional_forms() {
 }
 
 #[test]
-fn boolean_match_functions_keep_wildcards_and_effects_separate() {
+fn boolean_match_functions_keep_effects_separate() {
     let expected = [vec![
         "boolmatchws::conditional",
         "boolmatchws::matched",
         "boolmatchws::reversed",
+        "boolmatchws::wildcard",
     ]];
     for tokens in [0, 5] {
         let report = Echoes::default()
@@ -1197,6 +1199,170 @@ fn let_literal_functions_keep_pointer_sized_annotations_separate() {
         assert_eq!(function_groups(&scan(tokens)), expected);
     }
     assert_eq!(function_groups(&scan(13)).len(), 0);
+}
+
+const COMMUTATIVE_FIXTURE: &str = "tests/fixtures/commutews";
+
+#[test]
+fn commutative_doctests_group_only_the_reordered_native_operations() {
+    let report = Echoes::default().run(COMMUTATIVE_FIXTURE).unwrap();
+    assert_eq!(report.total, 4);
+    assert_eq!(report.unique, 3);
+    let expected = [vec!["commutews::Reordered", "commutews::Written"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(27)
+        .run(COMMUTATIVE_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(28)
+        .run(COMMUTATIVE_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn commutative_functions_keep_subtraction_order() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(COMMUTATIVE_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["commutews::product", "commutews::reversed_product"]];
+    for tokens in [0, 3] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(4)).len(), 0);
+}
+
+const IDENTITY_FIXTURE: &str = "tests/fixtures/identityws";
+
+#[test]
+fn identity_doctests_group_only_the_reduced_operands() {
+    let report = Echoes::default().run(IDENTITY_FIXTURE).unwrap();
+    assert_eq!(report.total, 4);
+    assert_eq!(report.unique, 2);
+    let expected = [vec![
+        "identityws::Padded",
+        "identityws::Plain",
+        "identityws::Scaled",
+    ]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(21)
+        .run(IDENTITY_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(22)
+        .run(IDENTITY_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn identity_functions_keep_other_constants_separate() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(IDENTITY_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec![
+        "identityws::padded",
+        "identityws::plain",
+        "identityws::scaled",
+    ]];
+    for tokens in [0, 3] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(4)).len(), 0);
+}
+
+const NESTED_IF_FIXTURE: &str = "tests/fixtures/nestedifws";
+
+#[test]
+fn nested_conditional_doctests_group_only_equal_fallbacks() {
+    let report = Echoes::default().run(NESTED_IF_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["nestedifws::Joined", "nestedifws::Nested"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(28)
+        .run(NESTED_IF_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(29)
+        .run(NESTED_IF_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn nested_conditional_functions_merge_conditions_and_wildcard_arms() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(NESTED_IF_FIXTURE)
+            .unwrap()
+    };
+    let wildcard = vec!["nestedifws::conditional", "nestedifws::selected"];
+    let nested = vec!["nestedifws::joined", "nestedifws::nested"];
+    for tokens in [0, 5] {
+        assert_eq!(
+            function_groups(&scan(tokens)),
+            [wildcard.clone(), nested.clone()]
+        );
+    }
+    assert_eq!(function_groups(&scan(8)), [nested]);
+    assert_eq!(function_groups(&scan(9)).len(), 0);
+}
+
+const EARLY_RETURN_FIXTURE: &str = "tests/fixtures/earlyretws";
+
+#[test]
+fn early_return_doctests_group_with_their_branches() {
+    let report = Echoes::default().run(EARLY_RETURN_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["earlyretws::Branched", "earlyretws::Early"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(23)
+        .run(EARLY_RETURN_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(24)
+        .run(EARLY_RETURN_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn early_return_functions_group_with_branches_and_else_if_ladders() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(EARLY_RETURN_FIXTURE)
+            .unwrap()
+    };
+    let expected = [
+        vec!["earlyretws::branched", "earlyretws::early"],
+        vec!["earlyretws::chained", "earlyretws::ladder"],
+    ];
+    for tokens in [0, 9] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(10)).len(), 0);
 }
 
 const CONTEXT_FIXTURE: &str = "tests/fixtures/contextws";
