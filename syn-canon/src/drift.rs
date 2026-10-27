@@ -77,10 +77,7 @@ fn canon_float_str(s: &str) -> String {
     out
 }
 
-/// Fold arm braces, doc attributes, and `use` shapes in place. When `compiles`, also fold the
-/// spellings only a compiling program makes equivalent. An `observed` file is the input of an
-/// enclosing attribute macro and keeps its spelling. With `std_names`, the scopes around the
-/// file leave every std derive, formatting macro and crate root bound to the std item.
+/// Normalize unobserved spelling under compilation and lexical standard-name proofs.
 pub(crate) fn normalize_file(
     file: &mut syn::File,
     compiles: bool,
@@ -131,7 +128,7 @@ pub(crate) fn normalize_expr(expr: &mut syn::Expr, frames: &[crate::scope::Frame
 }
 
 /// The std names the scopes `frames` record bind to something else.
-fn frames_rebound(frames: &[crate::scope::Frame]) -> u32 {
+fn frames_rebound(frames: &[crate::scope::Frame]) -> u64 {
     use crate::scope::Ns;
 
     let imported = frames
@@ -139,16 +136,11 @@ fn frames_rebound(frames: &[crate::scope::Frame]) -> u32 {
         .fold(0, |rebound, frame| rebound | frame.std_rebound);
     STD_DERIVES
         .into_iter()
-        .chain(FORMAT_MACROS.map(|(name, _, _)| name))
+        .chain(crate::COMMA_BLIND_MACROS)
         .map(|name| (Ns::Macro, name))
         .chain(CRATE_ROOTS.map(|name| (Ns::Type, name)))
         .filter(|&(ns, name)| frames.iter().any(|frame| frame.lookup(ns, name).is_some()))
         .fold(imported, |rebound, (_, name)| rebound | std_name_bit(name))
-}
-
-/// The parse-only tail-return fold of a function body.
-pub(crate) fn fold_fn_body(block: &mut syn::Block) {
-    fold_tail_return(&mut block.stmts);
 }
 
 /// The drift folds of everything outside macro input. A node an attribute macro or a
@@ -156,7 +148,7 @@ pub(crate) fn fold_fn_body(block: &mut syn::Block) {
 /// resolution relies on.
 #[derive(Default)]
 struct Drift<'a> {
-    /// The code compiles, so an unneeded `mut` and the semicolon of a `()` block fold.
+    /// The syntax compiles, permitting binding and constant-value folds.
     compiles: bool,
     /// Inside an impl header's trait path or self type, where a path may not
     /// elide its lifetime (E0726).
@@ -164,7 +156,7 @@ struct Drift<'a> {
     /// The scopes around the file leave every std name bound to the std item.
     std_names: bool,
     /// The std names the file rebinds wherever it sits.
-    file_rebound: u32,
+    file_rebound: u64,
     /// The std name bindings of the scopes around the current node, innermost last.
     std_scopes: Vec<StdScope>,
     helpers: Option<&'a mut crate::helpers::HelperSyntax>,
@@ -247,35 +239,12 @@ impl VisitMut for Drift<'_> {
         self.std_scopes.pop();
     }
 
-    fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
-        syn::visit_mut::visit_item_fn_mut(self, node);
-        self.fold_fn_body(&node.sig, &mut node.block);
-    }
-
-    fn visit_impl_item_fn_mut(&mut self, node: &mut syn::ImplItemFn) {
-        syn::visit_mut::visit_impl_item_fn_mut(self, node);
-        self.fold_fn_body(&node.sig, &mut node.block);
-    }
-
-    fn visit_trait_item_fn_mut(&mut self, node: &mut syn::TraitItemFn) {
-        syn::visit_mut::visit_trait_item_fn_mut(self, node);
-        if let Some(block) = &mut node.default {
-            self.fold_fn_body(&node.sig, block);
-        }
-    }
-
-    fn visit_expr_async_mut(&mut self, node: &mut syn::ExprAsync) {
-        syn::visit_mut::visit_expr_async_mut(self, node);
-        fold_tail_return(&mut node.block.stmts);
-    }
-
     fn visit_arm_mut(&mut self, arm: &mut syn::Arm) {
         if has_macro_attribute(&arm.attrs) {
             self.observed().visit_arm_mut(arm);
             return;
         }
         strip_inert_attrs(&mut arm.attrs);
-        unwrap_arm_block(arm);
         // The printer writes the comma a non-block arm needs, a written one is drift.
         arm.comma = None;
         syn::visit_mut::visit_arm_mut(self, arm);
@@ -327,10 +296,6 @@ impl VisitMut for Drift<'_> {
                     fold_unit_return(&mut closure.output);
                 }
             }
-            if let syn::Expr::Block(block) = closure.body.as_mut() {
-                fold_tail_return(&mut block.block.stmts);
-            }
-            unwrap_single_expr_block(&mut closure.body);
         }
         if self.compiles {
             if let syn::Expr::Return(ret) = expr
@@ -345,9 +310,6 @@ impl VisitMut for Drift<'_> {
                 syn::Expr::ForLoop(for_loop) => drop_binding_mut(&mut for_loop.pat),
                 syn::Expr::Let(expr_let) => drop_binding_mut(&mut expr_let.pat),
                 _ => {}
-            }
-            if let Some(block) = unit_block(expr) {
-                drop_tail_semicolon(&mut block.stmts);
             }
         }
         fold_signed_zero(expr);
@@ -821,7 +783,7 @@ impl Drift<'_> {
     /// The std names the scopes from the innermost module scope inward may bind to something
     /// else, with every module a `use super::*` reaches, all of them when one reaches past the
     /// outermost scope.
-    fn rebound_names(&self) -> u32 {
+    fn rebound_names(&self) -> u64 {
         let mut rebound = self.file_rebound;
         // The module levels past the innermost one a `use super::*` brings into view.
         let mut levels = 0;
@@ -836,43 +798,6 @@ impl Drift<'_> {
             }
         }
         StdScope::ALL
-    }
-
-    /// Fold a function body's tail `return`, and its tail semicolon when the
-    /// signature makes the value `()`, before and after the return fold since
-    /// each can expose the other.
-    fn fold_fn_body(&self, sig: &syn::Signature, block: &mut syn::Block) {
-        let unit = self.compiles && matches!(sig.output, syn::ReturnType::Default);
-        if unit {
-            drop_tail_semicolon(&mut block.stmts);
-        }
-        fold_tail_return(&mut block.stmts);
-        if unit {
-            drop_tail_semicolon(&mut block.stmts);
-        }
-    }
-}
-
-/// The block of a loop, or the then block of an `if` chain without a final
-/// `else`, whose value rustc requires to be `()`.
-fn unit_block(expr: &mut syn::Expr) -> Option<&mut syn::Block> {
-    match expr {
-        syn::Expr::ForLoop(e) => Some(&mut e.body),
-        syn::Expr::While(e) => Some(&mut e.body),
-        syn::Expr::Loop(e) => Some(&mut e.body),
-        syn::Expr::If(e) if discards_value(e) => Some(&mut e.then_branch),
-        _ => None,
-    }
-}
-
-/// Whether the `if` chain from `expr_if` ends without an `else` block.
-fn discards_value(mut expr_if: &syn::ExprIf) -> bool {
-    loop {
-        match expr_if.else_branch.as_ref().map(|(_, e)| e.as_ref()) {
-            None => return true,
-            Some(syn::Expr::If(inner)) => expr_if = inner,
-            Some(_) => return false,
-        }
     }
 }
 
@@ -945,16 +870,6 @@ fn fold_pattern_spelling(pat: &mut syn::Pat) {
     }
 }
 
-/// Drop the semicolon of a tail statement whose value is `()` either way, the
-/// rewrite clippy's `semicolon_if_nothing_returned` makes in reverse.
-fn drop_tail_semicolon(stmts: &mut [syn::Stmt]) {
-    match stmts.last_mut() {
-        Some(syn::Stmt::Expr(_, semi)) => *semi = None,
-        Some(syn::Stmt::Macro(mac)) => mac.semi_token = None,
-        _ => {}
-    }
-}
-
 /// Drop the semicolon after every non-tail statement ending in a block, an
 /// empty statement rustc's `redundant_semicolons` reports.
 fn drop_block_statement_semicolons(stmts: &mut [syn::Stmt]) {
@@ -978,28 +893,6 @@ fn drop_block_statement_semicolons(stmts: &mut [syn::Stmt]) {
         {
             *semi = None;
         }
-    }
-}
-
-/// An arm body `{ expr }` becomes `expr`, the form rustfmt writes.
-fn unwrap_arm_block(arm: &mut syn::Arm) {
-    unwrap_single_expr_block(&mut arm.body);
-}
-
-/// A closure or arm body `{ expr }` becomes `expr` when the block holds
-/// exactly one tail expression and carries no label or attributes.
-fn unwrap_single_expr_block(body: &mut Box<syn::Expr>) {
-    let syn::Expr::Block(block) = body.as_mut() else {
-        return;
-    };
-    if block.label.is_some()
-        || !block.attrs.is_empty()
-        || !matches!(block.block.stmts.as_slice(), [syn::Stmt::Expr(_, None)])
-    {
-        return;
-    }
-    if let Some(syn::Stmt::Expr(expr, None)) = block.block.stmts.pop() {
-        **body = expr;
     }
 }
 
@@ -1030,67 +923,6 @@ fn drop_empty_stmts(stmts: &mut Vec<syn::Stmt>) {
             syn::Stmt::Expr(syn::Expr::Verbatim(v), Some(_)) if v.is_empty()
         )
     });
-}
-
-/// Replace a tail `return expr`, with or without the semicolon, with
-/// `expr`, then propagate through every tail position forwarding its value,
-/// an `if` only with an `else` clause because rustc rejects a valued return
-/// in a discarded then position (`E0317`). A tail unit `return` adds
-/// nothing and goes. A return keeping a live attribute, `#[cfg]` for
-/// instance, must not fold, the fold would drop the condition.
-fn fold_tail_return(stmts: &mut Vec<syn::Stmt>) {
-    let Some(last) = stmts.last_mut() else {
-        return;
-    };
-    match last {
-        syn::Stmt::Expr(syn::Expr::Return(ret), _) => {
-            strip_inert_attrs(&mut ret.attrs);
-            if !ret.attrs.is_empty() {
-                return;
-            }
-            if let Some(mut inner) = ret.expr.take() {
-                fold_tail_expr(&mut inner);
-                *last = syn::Stmt::Expr(*inner, None);
-            } else {
-                stmts.pop();
-                fold_tail_return(stmts);
-            }
-        }
-        syn::Stmt::Expr(expr, None) => fold_tail_expr(expr),
-        _ => {}
-    }
-}
-
-/// Continue the fold through an expression whose tail value is the enclosing
-/// tail's value.
-fn fold_tail_expr(expr: &mut syn::Expr) {
-    match expr {
-        syn::Expr::Block(block) => fold_tail_return(&mut block.block.stmts),
-        syn::Expr::Unsafe(block) => fold_tail_return(&mut block.block.stmts),
-        syn::Expr::If(expr_if) if expr_if.else_branch.is_some() => {
-            fold_tail_return(&mut expr_if.then_branch.stmts);
-            if let Some((_, otherwise)) = &mut expr_if.else_branch {
-                fold_tail_expr(otherwise);
-            }
-        }
-        syn::Expr::Match(expr_match) => {
-            for arm in &mut expr_match.arms {
-                fold_tail_expr(&mut arm.body);
-                unwrap_single_expr_block(&mut arm.body);
-            }
-        }
-        // An arm body `return value`, written bare or as a block the arm fold unwrapped.
-        syn::Expr::Return(ret) => {
-            strip_inert_attrs(&mut ret.attrs);
-            if ret.attrs.is_empty()
-                && let Some(inner) = ret.expr.take()
-            {
-                *expr = *inner;
-                fold_tail_expr(expr);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Give every statement macro but the last one a semicolon, which the
@@ -1452,12 +1284,11 @@ const FORMAT_MACROS: [(&str, usize, bool); 18] = [
 /// The crate roots the paths of std macros start from.
 const CRATE_ROOTS: [&str; 3] = ["std", "core", "alloc"];
 
-/// The bit of a std name a local binding can change, a std derive, a std formatting macro or a
-/// crate root, zero for any other name.
-pub(crate) fn std_name_bit(name: &str) -> u32 {
+/// The bit of a standard derive, supported macro or crate root, zero for other names.
+pub(crate) fn std_name_bit(name: &str) -> u64 {
     STD_DERIVES
         .into_iter()
-        .chain(FORMAT_MACROS.map(|(name, _, _)| name))
+        .chain(crate::COMMA_BLIND_MACROS)
         .chain(CRATE_ROOTS)
         .position(|std| std == name)
         .map_or(0, |index| 1 << index)
@@ -1469,14 +1300,14 @@ pub(crate) fn std_name_bit(name: &str) -> u32 {
 struct StdScope {
     /// A module scope, whose bindings hide nothing from the scopes outside it.
     module: bool,
-    rebound: u32,
+    rebound: u64,
     /// The most enclosing module levels a `use super::*` of the scope reaches, whose bindings
     /// the scope sees too.
     supers: usize,
 }
 
 impl StdScope {
-    const ALL: u32 = ALL_STD_NAMES;
+    const ALL: u64 = ALL_STD_NAMES;
 
     fn of<'a>(items: impl Iterator<Item = &'a syn::Item>, module: bool) -> Self {
         let mut scope = Self {
@@ -1587,8 +1418,8 @@ pub(crate) fn macro_glob<S: ?Sized + PartialEq<str>>(prefix: &[&S], depth: usize
 }
 
 /// Every std name bit of [`std_name_bit`].
-pub(crate) const ALL_STD_NAMES: u32 =
-    (1 << (STD_DERIVES.len() + FORMAT_MACROS.len() + CRATE_ROOTS.len())) - 1;
+pub(crate) const ALL_STD_NAMES: u64 =
+    (1 << (STD_DERIVES.len() + crate::COMMA_BLIND_MACROS.len() + CRATE_ROOTS.len())) - 1;
 
 /// The std name bit an import of `prefix` under `alias` rebinds, zero for a path through a std
 /// crate root that keeps the std item under its own name.
@@ -1596,7 +1427,7 @@ pub(crate) fn import_rebound<S: ?Sized + PartialEq<str>>(
     prefix: &[&S],
     name: &str,
     alias: &str,
-) -> u32 {
+) -> u64 {
     if matches!(glob_target(prefix), GlobTarget::Std) && name == alias {
         0
     } else {
@@ -1607,8 +1438,8 @@ pub(crate) fn import_rebound<S: ?Sized + PartialEq<str>>(
 /// The std names a file rebinds wherever it sits, by a `macro_rules!` definition of the name,
 /// whose textual scope reaches past its module, or by a `#[macro_use] extern crate`, whose
 /// macros the whole crate sees ahead of the std ones.
-pub(crate) fn file_rebound(file: &syn::File) -> u32 {
-    struct Definitions(u32);
+pub(crate) fn file_rebound(file: &syn::File) -> u64 {
+    struct Definitions(u64);
 
     impl<'ast> syn::visit::Visit<'ast> for Definitions {
         fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
@@ -1638,6 +1469,14 @@ pub(crate) fn file_rebound(file: &syn::File) -> u32 {
 pub(crate) fn module_std_names(items: &[syn::Item]) -> (bool, usize) {
     let scope = StdScope::of(items.iter(), true);
     (scope.rebound == 0, scope.supers)
+}
+
+pub(crate) fn block_std_names(block: &syn::Block) -> bool {
+    let items = block.stmts.iter().filter_map(|stmt| match stmt {
+        syn::Stmt::Item(item) => Some(item),
+        _ => None,
+    });
+    StdScope::of(items, false).rebound == 0
 }
 
 /// Whether `attrs` derive anything outside the std derives, a proc macro that reads the item.
@@ -1791,7 +1630,7 @@ impl VisitMut for StaticRefs {
 /// comments, lint-level directives, and the `rustfmt::` tool attributes. A
 /// `doc` whose value is a macro call runs at compile time and can fail, so it
 /// stays.
-fn is_inert_attr(attr: &syn::Attribute) -> bool {
+pub(crate) fn is_inert_attr(attr: &syn::Attribute) -> bool {
     inert_meta(&attr.meta)
 }
 
@@ -1810,11 +1649,11 @@ fn computed_doc(meta: &syn::Meta) -> bool {
 }
 
 /// Drop inert attributes from the list.
-fn strip_inert_attrs(attrs: &mut Vec<syn::Attribute>) {
+pub(crate) fn strip_inert_attrs(attrs: &mut Vec<syn::Attribute>) {
     attrs.retain(|attr| !is_inert_attr(attr));
 }
 
-fn pat_attrs(pat: &mut syn::Pat) -> Option<&mut Vec<syn::Attribute>> {
+pub(crate) fn pat_attrs(pat: &mut syn::Pat) -> Option<&mut Vec<syn::Attribute>> {
     Some(match pat {
         syn::Pat::Const(p) => &mut p.attrs,
         syn::Pat::Guard(p) => &mut p.attrs,
@@ -2068,7 +1907,7 @@ pub(crate) fn format_operand(path: &syn::Path) -> Option<(usize, bool)> {
 /// The [`format_operand`] of a call `path` proves to name a std formatting macro, with
 /// `rebound` the std names the scopes around the call bind to something else. A bare name
 /// needs its own name free, a `std::`, `alloc::format` or `core::format_args` path its root.
-fn std_format_operand(path: &syn::Path, rebound: u32) -> Option<(usize, bool)> {
+fn std_format_operand(path: &syn::Path, rebound: u64) -> Option<(usize, bool)> {
     let operand = format_operand(path)?;
     let free = |ident: &syn::Ident| rebound & std_name_bit(&crate::scope::ident_name(ident)) == 0;
     let leaf = &path.segments.last()?.ident;
@@ -2094,7 +1933,7 @@ fn std_format_operand(path: &syn::Path, rebound: u32) -> Option<(usize, bool)> {
 /// `println!("{}", x)` becoming `println!("{x}")`, in `mac` and in every proven formatting
 /// call among its arguments, with `rebound` the std names the scopes around `mac` bind to
 /// something else. Any other macro keeps its tokens as written. Returns whether `mac` changed.
-fn inline_format_args(mac: &mut syn::Macro, rebound: u32) -> bool {
+fn inline_format_args(mac: &mut syn::Macro, rebound: u64) -> bool {
     use syn::parse::Parser;
 
     let Some((at, panic)) = std_format_operand(&mac.path, rebound) else {
@@ -2121,7 +1960,7 @@ fn inline_format_args(mac: &mut syn::Macro, rebound: u32) -> bool {
 /// Inlines the proven formatting calls inside a macro's arguments, which the drift visit never
 /// enters.
 struct NestedFormat {
-    rebound: u32,
+    rebound: u64,
     changed: bool,
 }
 

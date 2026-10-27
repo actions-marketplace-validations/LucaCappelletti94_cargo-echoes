@@ -69,6 +69,7 @@ struct Resolved<'env> {
     port: usize,
     target: Option<usize>,
     helper: Option<crate::scope::HelperId>,
+    macro_resolution: Option<crate::macros::MacroResolution>,
     /// The canon of an inherited binding. A local binding's canon is in the local table.
     inherited: Option<&'env str>,
 }
@@ -315,6 +316,7 @@ pub(crate) struct Renamer<'env> {
     after_bare_qself: bool,
     /// Raw-involved identifiers in macro input keep their token spelling.
     opaque_tokens: bool,
+    macro_punctuation_observed: bool,
     macro_supported: bool,
     /// A passing doctest: the scheduling analysis runs on its function blocks.
     compiles: bool,
@@ -328,6 +330,7 @@ pub(crate) struct Renamer<'env> {
     /// A live observer attribute froze the declarations being visited.
     observed: bool,
     constants_observed: bool,
+    tail_blocked: bool,
     constants_prepared: bool,
     regions_active: bool,
     /// The block nesting level of the traversal.
@@ -373,6 +376,7 @@ impl<'env> Renamer<'env> {
             in_type: false,
             after_bare_qself: false,
             opaque_tokens: false,
+            macro_punctuation_observed: false,
             macro_supported: true,
             compiles: false,
             prim_fallback: false,
@@ -380,6 +384,7 @@ impl<'env> Renamer<'env> {
             inline_depth: 0,
             observed: false,
             constants_observed: false,
+            tail_blocked: false,
             constants_prepared: false,
             regions_active: true,
             depth: 0,
@@ -411,7 +416,15 @@ impl<'env> Renamer<'env> {
 
     /// One candidate pass against the inherited environment.
     pub(crate) fn contextual(inherited: Inherited<'env>) -> Self {
-        Self::base(true, inherited)
+        let observed = inherited.frames.iter().any(|frame| frame.observed);
+        let mut renamer = Self::base(true, inherited);
+        renamer.observed = observed;
+        renamer.tail_blocked = observed;
+        renamer
+    }
+
+    pub(crate) fn observes_tokens(&self) -> bool {
+        self.observed
     }
 
     /// A file pass with the optional seeded environment of a function view.
@@ -421,6 +434,7 @@ impl<'env> Renamer<'env> {
         renamer.prim_fallback = options.prim_fallback;
         renamer.std_names = options.std_names;
         renamer.observed = options.observed;
+        renamer.tail_blocked = options.enclosing_observed;
         renamer.seed = options.seed;
         renamer.generics = options.generics;
         if let Some(table) = options.helper_table {
@@ -453,6 +467,7 @@ impl<'env> Renamer<'env> {
                     target: None,
                     raw: false,
                     helper: None,
+                    macro_resolution: None,
                 },
             );
             renamer.self_frame = Some(frame);
@@ -700,6 +715,7 @@ impl<'env> Renamer<'env> {
             target: None,
             raw: false,
             helper: None,
+            macro_resolution: None,
         };
         self.local_canons.insert(id, canon);
         self.top_bind(ns, name, binding.clone());
@@ -712,6 +728,7 @@ impl<'env> Renamer<'env> {
         name: &str,
         target: Option<usize>,
         origin: Origin,
+        standard: Option<crate::macros::MacroResolution>,
     ) -> Binding {
         let id = self.alloc_id();
         let canon = self.local_canon(Ns::Value);
@@ -725,6 +742,7 @@ impl<'env> Renamer<'env> {
             target,
             raw: false,
             helper: None,
+            macro_resolution: standard,
         };
         self.local_canons.insert(id, canon);
         self.top_bind(Ns::Value, name, binding.clone());
@@ -821,6 +839,7 @@ impl<'env> Renamer<'env> {
             port: binding.port,
             target: binding.target,
             helper: binding.helper,
+            macro_resolution: binding.macro_resolution,
             inherited,
         }
     }
@@ -829,11 +848,20 @@ impl<'env> Renamer<'env> {
     /// namespace priority first. A raw name that resolves keeps its
     /// binding, an unresolved raw token stays opaque by default.
     fn lookup(&self, ns: &[Ns], name: &str) -> Option<Resolved<'env>> {
+        self.lookup_with_opaque(ns, name, self.opaque_tokens)
+    }
+
+    fn lookup_with_opaque(
+        &self,
+        ns: &[Ns],
+        name: &str,
+        opaque_tokens: bool,
+    ) -> Option<Resolved<'env>> {
         let inherited: &'env [Frame] = self.inherited.frames;
         for ns in ns {
             for frame in self.frames.iter().rev() {
                 if let Some(binding) = frame.lookup(*ns, name) {
-                    if self.opaque_tokens && (binding.raw || name.starts_with("r#")) {
+                    if opaque_tokens && (binding.raw || name.starts_with("r#")) {
                         return None;
                     }
                     return Some(Self::resolved(Domain::Local, *ns, binding, None));
@@ -854,7 +882,7 @@ impl<'env> Renamer<'env> {
                         .map(|binding| (binding, binding.canon.as_str()))
                 });
             if let Some((binding, canon)) = found {
-                if self.opaque_tokens && (binding.raw || name.starts_with("r#")) {
+                if opaque_tokens && (binding.raw || name.starts_with("r#")) {
                     return None;
                 }
                 return Some(Self::resolved(Domain::Inherited, *ns, binding, Some(canon)));
@@ -1018,7 +1046,14 @@ impl<'env> Renamer<'env> {
         if let Some(resolved) = self.lookup(ns, &ident.to_string())
             && resolved.target.is_none()
         {
-            rename(ident, &self.render(&resolved));
+            match resolved.domain {
+                Domain::Local => {
+                    if let Some(canon) = self.local_canons.get(&resolved.id) {
+                        rename(ident, canon);
+                    }
+                }
+                Domain::Inherited => rename(ident, &self.render(&resolved)),
+            }
         }
     }
 
@@ -1165,6 +1200,58 @@ impl<'env> Renamer<'env> {
             && !self.cfg_blocked()
     }
 
+    /// Replace a built-in `concat!` of string literals with the literal of its joined value.
+    fn fold_concat(&self, expr: &mut syn::Expr) {
+        if let syn::Expr::Macro(call) = expr
+            && let Some(literal) = self.concat_literal(call)
+        {
+            *expr = syn::Expr::Lit(syn::ExprLit {
+                attrs: Vec::new(),
+                lit: syn::Lit::Str(literal),
+            });
+        }
+    }
+
+    /// The literal of an unattributed built-in `concat!` of string literals, in compiling
+    /// mode outside observed syntax.
+    fn concat_literal(&self, call: &syn::ExprMacro) -> Option<syn::LitStr> {
+        if !call.attrs.is_empty() || !self.constants_allowed() || self.macro_punctuation_observed {
+            return None;
+        }
+        let value = self.concat_value(&call.mac)?;
+        Some(syn::LitStr::new(&value, call.mac.bang_token.span))
+    }
+
+    /// The joined value of a call the scopes resolve to the built-in `concat!`, every
+    /// argument an unsuffixed, unattributed string literal.
+    fn concat_value(&self, mac: &syn::Macro) -> Option<String> {
+        let Some(crate::macros::MacroResolution::Macro(_)) = self.standard_name(&mac.path, false)
+        else {
+            return None;
+        };
+        if crate::scope::ident_name(&mac.path.segments.last()?.ident) != "concat" {
+            return None;
+        }
+        let MacroArgs::List(args) = syn::parse2::<MacroArgs>(mac.tokens.clone()).ok()? else {
+            return None;
+        };
+        let mut value = String::new();
+        for arg in &args {
+            let syn::Expr::Lit(syn::ExprLit {
+                attrs,
+                lit: syn::Lit::Str(literal),
+            }) = arg
+            else {
+                return None;
+            };
+            if !attrs.is_empty() || !literal.suffix().is_empty() {
+                return None;
+            }
+            value.push_str(&literal.value());
+        }
+        Some(value)
+    }
+
     /// Whether an open frame carries a glob import that may shadow a
     /// type name.
     pub(crate) fn glob_uncertain(&self) -> bool {
@@ -1180,6 +1267,16 @@ impl<'env> Renamer<'env> {
     /// The facts of the most recently analyzed block, when any.
     pub(crate) fn last_block_facts(&self) -> Option<&schedule::BlockFacts> {
         self.block_facts.last()
+    }
+
+    fn tails_allowed(&self) -> bool {
+        !self.analysis && !self.tail_blocked && self.macro_origins.is_none()
+    }
+
+    pub(crate) fn normalize_return_body(&self, block: &mut syn::Block) {
+        if self.tails_allowed() {
+            crate::tails::normalize(self, block);
+        }
     }
 
     /// The proven primitive type of a declared type, when the declaration
@@ -1272,6 +1369,81 @@ impl<'env> Renamer<'env> {
         })
     }
 
+    fn standard_unbound(&self, name: &str) -> bool {
+        let bit = crate::drift::std_name_bit(name);
+        self.frames
+            .iter()
+            .chain(self.inherited.frames)
+            .chain(self.seed)
+            .chain(self.generics)
+            .all(|frame| !frame.glob && frame.std_rebound & bit == 0)
+    }
+
+    fn standard_name(
+        &self,
+        path: &syn::Path,
+        import: bool,
+    ) -> Option<crate::macros::MacroResolution> {
+        use crate::macros::{MacroResolution, StandardRoot};
+
+        if self.helper_blocked
+            || path
+                .segments
+                .iter()
+                .any(|segment| !matches!(segment.arguments, syn::PathArguments::None))
+        {
+            return None;
+        }
+        let first = path.segments.first()?;
+        let head = crate::scope::ident_name(&first.ident);
+        if path.segments.len() == 1 {
+            let ns: &[Ns] = if import {
+                &[Ns::Type, Ns::Macro]
+            } else {
+                &[Ns::Macro]
+            };
+            if let Some(binding) = self.lookup_with_opaque(ns, &head, false) {
+                return self.standard_binding(binding);
+            }
+            if !self.standard_unbound(&head) {
+                return None;
+            }
+            return if import {
+                StandardRoot::named(&head).map(MacroResolution::Crate)
+            } else if (self.context || self.std_names) && path.leading_colon.is_none() {
+                StandardRoot::Std.grammar(&head).map(MacroResolution::Macro)
+            } else {
+                None
+            };
+        }
+        if path.segments.len() != 2 {
+            return None;
+        }
+        let root = if let Some(binding) = self.lookup_with_opaque(&[Ns::Type], &head, false) {
+            let Some(MacroResolution::Crate(root)) = self.standard_binding(binding) else {
+                return None;
+            };
+            root
+        } else {
+            if !self.standard_unbound(&head) {
+                return None;
+            }
+            StandardRoot::named(&head)?
+        };
+        let name = crate::scope::ident_name(&path.segments.last()?.ident);
+        if import && name == "self" {
+            return Some(MacroResolution::Crate(root));
+        }
+        root.grammar(&name).map(MacroResolution::Macro)
+    }
+
+    fn standard_binding(&self, binding: Resolved<'_>) -> Option<crate::macros::MacroResolution> {
+        binding.macro_resolution.or_else(|| {
+            let target = self.target_of(binding.domain, binding.target?);
+            crate::macros::MacroResolution::external_target(target)
+        })
+    }
+
     /// The block nesting level of the traversal.
     pub(crate) fn depth(&self) -> usize {
         self.depth
@@ -1348,6 +1520,17 @@ impl<'env> Renamer<'env> {
 
     /// Bind one imported macro name into the current frame.
     fn prebind_macro_name(&mut self, name: &str) {
+        let opaque = self
+            .frames
+            .last()
+            .and_then(|frame| frame.lookup(Ns::Macro, name))
+            .is_some_and(|binding| binding.origin == Origin::Use)
+            || self
+                .lookup_with_opaque(&[Ns::Macro], name, false)
+                .is_some_and(|binding| {
+                    binding.origin == Origin::MacroRule
+                        || binding.macro_resolution == Some(crate::macros::MacroResolution::Opaque)
+                });
         let id = self.alloc_id();
         self.top_bind(
             Ns::Macro,
@@ -1362,6 +1545,7 @@ impl<'env> Renamer<'env> {
                 target: None,
                 raw: false,
                 helper: None,
+                macro_resolution: opaque.then_some(crate::macros::MacroResolution::Opaque),
             },
         );
     }
@@ -1935,11 +2119,46 @@ impl<'env> Renamer<'env> {
         &mut self,
         tokens: proc_macro2::TokenStream,
         format_at: Option<usize>,
+        grammar: Option<crate::macros::MacroGrammar>,
     ) -> proc_macro2::TokenStream {
+        use crate::macros::{MacroGrammar, MatchesArgs};
+
+        if grammar == Some(MacroGrammar::Matches) {
+            let Ok(mut args) = syn::parse2::<MatchesArgs>(tokens.clone()) else {
+                self.macro_supported = false;
+                return self.rename_tokens(tokens);
+            };
+            if !self.analysis && !self.macro_punctuation_observed {
+                args.trailing = None;
+            }
+            self.helper_syntax.clear_expr(&args.value);
+            self.visit_expr_mut(&mut args.value);
+            self.push();
+            rewrite_pat_bindings(self, &mut args.pattern);
+            self.visit_pat_mut(&mut args.pattern);
+            if let Some((_, guard)) = &mut args.guard {
+                self.helper_syntax.clear_expr(guard);
+                self.visit_expr_mut(guard);
+            }
+            self.pop();
+            return args.to_token_stream();
+        }
         let Ok(mut args) = syn::parse2::<MacroArgs>(tokens.clone()) else {
             self.macro_supported = false;
             return self.rename_tokens(tokens);
         };
+        let trusted = match grammar {
+            Some(MacroGrammar::Expressions) => matches!(args, MacroArgs::List(_)),
+            Some(MacroGrammar::Vector) => true,
+            Some(MacroGrammar::Matches) | None => false,
+        };
+        self.macro_punctuation_observed |= !trusted;
+        if !self.analysis
+            && !self.macro_punctuation_observed
+            && let MacroArgs::List(exprs) = &mut args
+        {
+            exprs.pop_punct();
+        }
         for (index, expr) in args.iter_mut().enumerate() {
             self.helper_syntax.clear_expr(expr);
             self.visit_expr_mut(expr);
@@ -1993,7 +2212,14 @@ impl<'env> Renamer<'env> {
                     let (rooted, segments) =
                         resolve_target_path(&|name| self.resolve_first_seg(name), rooted, prefix);
                     let target = self.store_target(rooted, segments);
-                    self.bind_value_and_type(alias, Some(target), Origin::Use);
+                    let resolution = if self.opaque_import(alias) {
+                        Some(crate::macros::MacroResolution::Opaque)
+                    } else {
+                        crate::macros::MacroResolution::external_target(
+                            self.targets.get(target).expect("a stored target"),
+                        )
+                    };
+                    self.bind_value_and_type(alias, Some(target), Origin::Use, resolution);
                 }
                 syn::UseTree::Name(name)
             }
@@ -2020,6 +2246,19 @@ impl<'env> Renamer<'env> {
                 glob
             }
         }
+    }
+
+    fn opaque_import(&self, name: &str) -> bool {
+        self.helper_blocked
+            || self
+                .frames
+                .last()
+                .and_then(|frame| frame.lookup(Ns::Macro, name))
+                .is_some_and(|binding| {
+                    (binding.origin == Origin::Use && !binding.canon.is_empty())
+                        || binding.origin == Origin::MacroRule
+                        || binding.macro_resolution == Some(crate::macros::MacroResolution::Opaque)
+                })
     }
 
     /// Bind one `use` leaf that imports `ident` under `alias`.
@@ -2054,11 +2293,17 @@ impl<'env> Renamer<'env> {
                 resolve_target_path(&|name| self.resolve_first_seg(name), rooted, &path);
             self.store_target(rooted, segments)
         });
-        let binding = self.bind_value_and_type(&alias.to_string(), target, Origin::Use);
+        let alias_name = alias.to_string();
+        let resolution = if self.opaque_import(&alias_name) {
+            Some(crate::macros::MacroResolution::Opaque)
+        } else {
+            self.standard_name(&helper_path, true)
+        };
+        let binding = self.bind_value_and_type(&alias_name, target, Origin::Use, resolution);
         if let Some(helper) = helper {
             self.frames.last_mut().expect("a scope frame").set_helper(
                 Ns::Value,
-                &alias.to_string(),
+                &alias_name,
                 helper,
             );
         }
@@ -2089,7 +2334,7 @@ impl<'env> Renamer<'env> {
         for name in &names {
             self.bind_full(Ns::Value, name, Origin::Let, None, 0, plan.take());
         }
-        syn::visit_mut::visit_pat_mut(self, pat);
+        self.visit_pat_mut(pat);
         rewrite_pat_bindings(self, pat);
     }
 
@@ -2109,6 +2354,8 @@ impl<'env> Renamer<'env> {
         );
         let observed = self.observed;
         self.observed |= crate::context::live_attr(attrs);
+        let tail_blocked = self.tail_blocked;
+        self.tail_blocked |= crate::tails::observed(attrs, self.std_names);
         let scoped = if self.compiles
             && let Some(block) = body.as_deref_mut()
         {
@@ -2148,6 +2395,7 @@ impl<'env> Renamer<'env> {
         visit_fn_inputs(self, sig.inputs.iter_mut());
         syn::visit_mut::visit_return_type_mut(self, &mut sig.output);
         if let Some(body) = body {
+            self.normalize_return_body(body);
             self.visit_block_mut(body);
         }
         self.pop();
@@ -2156,6 +2404,7 @@ impl<'env> Renamer<'env> {
             self.scopes.pop().expect("a fn scope");
         }
         self.observed = observed;
+        self.tail_blocked = tail_blocked;
         self.receiver = receiver;
     }
 
@@ -2205,6 +2454,7 @@ impl<'env> Renamer<'env> {
     /// The reference provenance and transported marker edges, consumed after the visit.
     pub(crate) fn into_reference_facts(mut self) -> ReferenceFacts {
         let mut facts = self.facts;
+        facts.observed = self.observed;
         let (paths, macros) = self.helper_syntax.take_marker_transport();
         facts.marker_paths.extend(paths);
         facts.marker_macros.extend(macros);
@@ -2570,6 +2820,21 @@ pub(crate) fn item_binding(item: &syn::Item) -> Option<(Ns, &Ident)> {
 /// `macro_rules!` and `use`, which are visible only after their line.
 fn prebind(renamer: &mut Renamer<'_>, items: &[&syn::Item]) {
     for item in items {
+        if let syn::Item::ExternCrate(item) = item {
+            let ident = item.rename.as_ref().map_or(&item.ident, |(_, alias)| alias);
+            let name = ident.to_string();
+            renamer.bind(Ns::Type, &name, Origin::Use);
+            renamer
+                .frames
+                .last_mut()
+                .expect("a scope frame")
+                .set_macro_resolution(
+                    Ns::Type,
+                    &name,
+                    crate::macros::MacroResolution::external_crate(item),
+                );
+            continue;
+        }
         let Some((ns, ident)) = item_binding(item) else {
             continue;
         };
@@ -2683,8 +2948,12 @@ fn begin_generics(renamer: &mut Renamer<'_>, generics: &mut syn::Generics) {
             }
             syn::GenericParam::Const(r#const) => {
                 // A bare reference in `Foo<N>` reads as a type argument.
-                let binding =
-                    renamer.bind_value_and_type(&r#const.ident.to_string(), None, Origin::Generic);
+                let binding = renamer.bind_value_and_type(
+                    &r#const.ident.to_string(),
+                    None,
+                    Origin::Generic,
+                    None,
+                );
                 if renamer.analysis {
                     renamer.record_ident(&r#const.ident, Ns::Type, binding.id, true);
                 } else {
@@ -2832,10 +3101,12 @@ fn visit_value_item(
     renamer.visit_attrs(attrs);
     syn::visit_mut::visit_type_mut(renamer, ty);
     syn::visit_mut::visit_expr_mut(renamer, expr);
+    renamer.fold_concat(expr);
 }
 
 impl VisitMut for Renamer<'_> {
     fn visit_file_mut(&mut self, file: &mut syn::File) {
+        self.tail_blocked |= crate::tails::observed(&file.attrs, self.std_names);
         self.observed |= crate::context::live_attr(&file.attrs);
         self.constants_observed |= crate::context::live_attr(&file.attrs);
         self.prim_fallback &= crate::context::scope_primitives_known(&file.items);
@@ -2847,6 +3118,9 @@ impl VisitMut for Renamer<'_> {
     }
 
     fn visit_item_mut(&mut self, item: &mut syn::Item) {
+        let tail_blocked = self.tail_blocked;
+        self.tail_blocked |=
+            crate::tails::observed(crate::helpers::item_attrs(item), self.std_names);
         let observed = self.constants_observed;
         self.constants_observed |=
             crate::drift::item_attrs(item).is_some_and(|attrs| crate::context::live_attr(attrs));
@@ -2860,9 +3134,12 @@ impl VisitMut for Renamer<'_> {
         self.regions_active = regions_active;
         self.constants_observed = observed;
         self.helper_blocked = helper_blocked;
+        self.tail_blocked = tail_blocked;
     }
 
     fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+        let tail_blocked = self.tail_blocked;
+        self.tail_blocked |= crate::tails::observed(crate::drift::expr_attrs(expr), self.std_names);
         let observed = self.constants_observed;
         self.constants_observed |= !crate::drift::expr_attrs(expr).is_empty();
         let prepared = self.constants_prepared;
@@ -2871,11 +3148,15 @@ impl VisitMut for Renamer<'_> {
         }
         self.constants_prepared = true;
         syn::visit_mut::visit_expr_mut(self, expr);
+        self.fold_concat(expr);
         self.constants_prepared = prepared;
         self.constants_observed = observed;
+        self.tail_blocked = tail_blocked;
     }
 
     fn visit_block_mut(&mut self, block: &mut syn::Block) {
+        let tail_blocked = self.tail_blocked;
+        self.tail_blocked |= crate::tails::blocked(self, block);
         self.push();
         let before_constants = self.helper_syntax.snapshot_block(block);
         let items: Vec<&syn::Item> = block
@@ -2891,6 +3172,9 @@ impl VisitMut for Renamer<'_> {
             if let syn::Item::Use(import) = item {
                 self.prebind_use_tree(&import.tree, &mut Vec::new());
             }
+        }
+        if self.compiles && self.tails_allowed() {
+            crate::tails::drop_exit_semicolon(self, block);
         }
         self.depth += 1;
         if self.constants_allowed() {
@@ -2955,20 +3239,33 @@ impl VisitMut for Renamer<'_> {
             let facts = self.block_facts.pop().expect("an analyzed block");
             facts.finish(block, &mut self.facts);
         }
+        self.tail_blocked = tail_blocked;
     }
 
     fn visit_local_mut(&mut self, local: &mut syn::Local) {
+        let tail_blocked = self.tail_blocked;
+        self.tail_blocked |= crate::tails::observed(&local.attrs, self.std_names);
         let observed = self.constants_observed;
         self.constants_observed |= !local.attrs.is_empty();
         // The initializer resolves under the outer bindings.
         if let Some(init) = &mut local.init {
             syn::visit_mut::visit_expr_mut(self, &mut init.expr);
+            self.fold_concat(&mut init.expr);
             if let Some(diverge) = &mut init.diverge {
                 syn::visit_mut::visit_expr_mut(self, &mut diverge.1);
             }
         }
         self.bind_pat(&mut local.pat);
         self.constants_observed = observed;
+        self.tail_blocked = tail_blocked;
+    }
+
+    fn visit_pat_mut(&mut self, pat: &mut syn::Pat) {
+        let tail_blocked = self.tail_blocked;
+        self.tail_blocked |= crate::drift::pat_attrs(pat)
+            .is_some_and(|attrs| crate::tails::observed(attrs, self.std_names));
+        syn::visit_mut::visit_pat_mut(self, pat);
+        self.tail_blocked = tail_blocked;
     }
 
     fn visit_item_fn_mut(&mut self, item: &mut syn::ItemFn) {
@@ -3032,6 +3329,7 @@ impl VisitMut for Renamer<'_> {
                 target: None,
                 raw: false,
                 helper: None,
+                macro_resolution: None,
             },
         );
         begin_generics(self, &mut item.generics);
@@ -3085,6 +3383,7 @@ impl VisitMut for Renamer<'_> {
                     target: None,
                     raw: false,
                     helper: None,
+                    macro_resolution: None,
                 },
             );
         }
@@ -3209,6 +3508,26 @@ impl VisitMut for Renamer<'_> {
         }
     }
 
+    fn visit_item_extern_crate_mut(&mut self, item: &mut syn::ItemExternCrate) {
+        self.visit_attrs(&mut item.attrs);
+        let ident = item.rename.as_ref().map_or(&item.ident, |(_, alias)| alias);
+        let name = ident.to_string();
+        let binding = self
+            .lookup_with_opaque(&[Ns::Type], &name, false)
+            .expect("a prebound external crate");
+        if self.analysis {
+            self.record_ident(ident, Ns::Type, binding.id, true);
+        } else if !self.opaque_tokens || !name.starts_with("r#") {
+            let canon = self.render(&binding);
+            let span = ident.span();
+            if let Some((_, alias)) = &mut item.rename {
+                rename(alias, &canon);
+            } else {
+                item.rename = Some((<syn::Token![as]>::default(), Ident::new(&canon, span)));
+            }
+        }
+    }
+
     fn visit_item_use_mut(&mut self, item: &mut syn::ItemUse) {
         self.visit_attrs(&mut item.attrs);
         let first = match &item.tree {
@@ -3287,22 +3606,42 @@ impl VisitMut for Renamer<'_> {
             }
         }
         for input in &mut closure.inputs {
-            syn::visit_mut::visit_pat_mut(self, input);
+            self.visit_pat_mut(input);
             rewrite_pat_bindings(self, input);
         }
         syn::visit_mut::visit_return_type_mut(self, &mut closure.output);
+        if self.tails_allowed() {
+            crate::tails::normalize_expr(self, &mut closure.body);
+            crate::tails::unwrap(self, &mut closure.body);
+        }
         syn::visit_mut::visit_expr_mut(self, &mut closure.body);
+        self.fold_concat(&mut closure.body);
         self.pop();
     }
 
+    fn visit_expr_async_mut(&mut self, expr: &mut syn::ExprAsync) {
+        self.normalize_return_body(&mut expr.block);
+        syn::visit_mut::visit_expr_async_mut(self, expr);
+    }
+
     fn visit_arm_mut(&mut self, arm: &mut syn::Arm) {
+        let tail_blocked = self.tail_blocked;
+        self.tail_blocked |= crate::tails::observed(&arm.attrs, self.std_names);
+        let observed = self.constants_observed;
+        self.constants_observed |= !arm.attrs.is_empty();
         self.push();
         if self.regions_active && self.values_allowed() && self.macro_origins.is_none() {
             crate::structure::literal_alternatives(arm);
         }
         self.bind_pat(&mut arm.pat);
+        if self.tails_allowed() && arm.attrs.is_empty() {
+            crate::tails::unwrap(self, &mut arm.body);
+        }
         syn::visit_mut::visit_expr_mut(self, &mut arm.body);
+        self.fold_concat(&mut arm.body);
         self.pop();
+        self.constants_observed = observed;
+        self.tail_blocked = tail_blocked;
     }
 
     fn visit_expr_for_loop_mut(&mut self, for_loop: &mut syn::ExprForLoop) {
@@ -3474,7 +3813,20 @@ impl VisitMut for Renamer<'_> {
             &[Ns::Macro]
         };
         self.record_path(&mac.path, ns, ns);
-        let known = self.std_format_path(&mac.path, Self::macro_shadowed);
+        let grammar = match self.standard_name(&mac.path, false) {
+            Some(crate::macros::MacroResolution::Macro(grammar))
+                if !self.observed
+                    && !self.macro_punctuation_observed
+                    && !self.constants_observed =>
+            {
+                Some(grammar)
+            }
+            _ => None,
+        };
+        let punctuation_parent = self.macro_punctuation_observed;
+        self.macro_punctuation_observed |= grammar.is_none();
+        let known = self.std_format_path(&mac.path, Self::macro_shadowed)
+            || self.concat_value(mac).is_some();
         // Another macro under a formatting name reads its string literal as written.
         let captures = self.std_format_path(
             &mac.path,
@@ -3494,11 +3846,13 @@ impl VisitMut for Renamer<'_> {
             .map(|(at, _)| at);
         let outer = core::mem::replace(&mut self.opaque_tokens, !known);
         if self.analysis {
-            let _ = self.rewrite_macro_tokens(mac.tokens.clone(), format_at);
+            let _ = self.rewrite_macro_tokens(mac.tokens.clone(), format_at, grammar);
         } else {
-            mac.tokens = self.rewrite_macro_tokens(core::mem::take(&mut mac.tokens), format_at);
+            mac.tokens =
+                self.rewrite_macro_tokens(core::mem::take(&mut mac.tokens), format_at, grammar);
         }
         self.opaque_tokens = outer;
+        self.macro_punctuation_observed = punctuation_parent;
         let origins = self.macro_origins.take().expect("a macro origin collector");
         let supported = known && self.macro_supported;
         self.macro_supported = if parent.is_some() {
@@ -3563,6 +3917,7 @@ impl VisitMut for Renamer<'_> {
         }
         if let Some(expr) = &mut node.expr {
             syn::visit_mut::visit_expr_mut(self, expr);
+            self.fold_concat(expr);
         }
     }
 
@@ -3574,7 +3929,7 @@ impl VisitMut for Renamer<'_> {
     }
 
     fn visit_pat_guard_mut(&mut self, node: &mut syn::PatGuard) {
-        syn::visit_mut::visit_pat_mut(self, &mut node.pat);
+        self.visit_pat_mut(&mut node.pat);
         walk_let_cond(self, &mut node.guard);
     }
 

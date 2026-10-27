@@ -111,7 +111,7 @@ impl Store {
 }
 
 /// A file exercising the canonicalizer's rename, drift and context paths.
-const SENTINEL: &str = r"
+const SENTINEL: &str = r#"
 pub mod alpha {
     use core::mem;
     pub struct Beta {
@@ -130,13 +130,60 @@ pub mod alpha {
         let zeta: u8 = 0;
         if value > 1u32 { value - 1u32 } else { u32::from(zeta) }
     }
+    pub fn reflexive(value: u32) -> bool {
+        value == value
+    }
+    pub fn xor(value: u32) -> u32 {
+        value ^ value
+    }
+    pub fn xor_literal(value: u32) -> u32 {
+        value ^ 7 ^ value
+    }
+    pub fn wrapping(value: u32, other: u32) -> u32 {
+        other.wrapping_add(value)
+    }
+    pub fn selected(flag: bool, value: u32, other: u32) -> u32 {
+        match flag {
+            false => other,
+            true => value,
+        }
+    }
+    pub fn joined() -> &'static str {
+        concat!("al", "pha")
+    }
+    pub fn unset(flag: bool) -> bool {
+        flag == false
+    }
+    pub fn both(flag: bool, other: bool) -> bool {
+        if other { flag } else { false }
+    }
+    pub fn accumulated(mut total: u32, step: u32) -> u32 {
+        total += step;
+        total
+    }
+    pub fn counted() -> u32 {
+        let start: u32 = 1;
+        start
+    }
+}
+mod custom {
+    macro_rules! vec {
+        (1) => { 10u32 };
+        (1,) => { 20u32 };
+    }
+    pub(crate) use vec;
+}
+fn tail_scope() -> u32 {
+    let value = std::cell::RefCell::new(7u32);
+    return *value.borrow();
 }
 fn main() {
     let beta = alpha::Beta { gamma: 3u32 };
     beta.delta(1u32);
     alpha::epsilon(2u32);
+    custom::vec!(1,);
 }
-";
+"#;
 
 /// A fingerprint of canonicalization output and the crate version.
 pub(crate) fn canonicalization_fingerprint() -> String {

@@ -81,7 +81,7 @@ fn bounds(block: &syn::Block, outer: usize) -> Bounds {
     scan
 }
 
-pub(super) fn within_bounds(block: &syn::Block, outer: usize) -> bool {
+pub(crate) fn within_bounds(block: &syn::Block, outer: usize) -> bool {
     bounds(block, outer).valid
 }
 
@@ -108,6 +108,12 @@ fn scalar_shape(expr: &syn::Expr, calls: bool) -> bool {
                             && super::scalar_tail(&block.block).is_some_and(|expr| scalar_shape(expr, calls)))
                 })
         }
+        syn::Expr::Match(r#match) => super::boolean_match(r#match).is_some_and(|(scrutinee, then, otherwise)| {
+            scalar_shape(scrutinee, calls)
+                && [then, otherwise]
+                    .into_iter()
+                    .all(|body| super::arm_tail(body).is_some_and(|expr| scalar_shape(expr, calls)))
+        }),
         _ => false,
     }
 }
@@ -199,6 +205,10 @@ fn expression_bounds(expr: &syn::Expr, outer: usize) -> Bounds {
     };
     scan.visit_expr(expr);
     scan
+}
+
+pub(crate) fn expression_within_bounds(expr: &syn::Expr) -> bool {
+    expression_bounds(expr, 0).valid
 }
 
 fn expand(

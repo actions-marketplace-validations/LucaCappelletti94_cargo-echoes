@@ -1,13 +1,13 @@
 //! Atomic source and expanded-expression limits through public comparison.
 
-fn xor_tree(leaf: &str, count: usize) -> String {
+fn binary_tree(op: &str, leaf: &str, count: usize) -> String {
     if count == 1 {
         return leaf.to_owned();
     }
     format!(
-        "({}^{})",
-        xor_tree(leaf, count / 2),
-        xor_tree(leaf, count - count / 2)
+        "({}{op}{})",
+        binary_tree(op, leaf, count / 2),
+        binary_tree(op, leaf, count - count / 2)
     )
 }
 
@@ -17,8 +17,14 @@ fn form(source: &str) -> syn_canon::CanonicalForm {
 
 #[test]
 fn expanded_node_limit_admits_the_exact_complete_region() {
-    let original = format!("fn f(x:u8)->u8{{let t=x&1u8;{}}}", xor_tree("t", 4096));
-    let inline = format!("fn f(x:u8)->u8{{{}}}", xor_tree("(x&1u8)", 4096));
+    let original = format!(
+        "fn f(x:bool)->bool{{let t=x^true;{}}}",
+        binary_tree("!=", "t", 4096)
+    );
+    let inline = format!(
+        "fn f(x:bool)->bool{{{}}}",
+        binary_tree("!=", "(x^true)", 4096)
+    );
     let left = form(&original);
     let right = form(&inline);
     assert_eq!(left, right);
@@ -32,8 +38,14 @@ fn expanded_node_limit_admits_the_exact_complete_region() {
 
 #[test]
 fn expanded_node_exhaustion_retains_the_complete_region() {
-    let original = format!("fn f(x:u8)->u8{{let t=x&1u8;{}}}", xor_tree("t", 4097));
-    let inline = format!("fn f(x:u8)->u8{{{}}}", xor_tree("(x&1u8)", 4097));
+    let original = format!(
+        "fn f(x:bool)->bool{{let t=x^true;{}}}",
+        binary_tree("!=", "t", 4097)
+    );
+    let inline = format!(
+        "fn f(x:bool)->bool{{{}}}",
+        binary_tree("!=", "(x^true)", 4097)
+    );
     let retained = form(&original);
     assert_ne!(retained, form(&inline));
     assert_eq!(retained.body_units(), 8_200);
@@ -64,11 +76,37 @@ fn expanded_expression_limit_keeps_every_original_binding_on_exhaustion() {
     }
 }
 
+/// A balanced tree of `count` operands joined by `op`: `first`, then the distinct parameters
+/// `a1`, `a2`, …, so no operand repeats and the tree keeps the node count of a tree of one
+/// repeated leaf. Returns the tree and the parameter declarations.
+fn distinct_tree(op: &str, first: &str, count: usize) -> (String, String) {
+    fn tree(op: &str, first: &str, next: &mut usize, count: usize) -> String {
+        if count == 1 {
+            let leaf = if *next == 0 {
+                first.to_owned()
+            } else {
+                format!("a{next}")
+            };
+            *next += 1;
+            return leaf;
+        }
+        let left = tree(op, first, next, count / 2);
+        let right = tree(op, first, next, count - count / 2);
+        format!("({left}{op}{right})")
+    }
+    let params = (1..count)
+        .map(|i| format!(",a{i}:bool"))
+        .collect::<Vec<_>>()
+        .concat();
+    (tree(op, first, &mut 0, count), params)
+}
+
 #[test]
 fn inherited_boolean_expansion_exhaustion_restores_every_value_binding() {
-    let operands = xor_tree("t", 8190).replace('^', "&&");
-    let original = format!("fn f(p:bool)->bool{{let t=p;!({operands})}}");
-    let inline = format!("fn f(p:bool)->bool{{!({})}}", operands.replace('t', "p"));
+    let (operands, params) = distinct_tree("&&", "t", 8190);
+    let (inline_operands, _) = distinct_tree("&&", "p", 8190);
+    let original = format!("fn f(p:bool{params})->bool{{let t=p;!({operands})}}");
+    let inline = format!("fn f(p:bool{params})->bool{{!({inline_operands})}}");
     let retained = form(&original);
     assert_ne!(retained, form(&inline));
     assert_eq!(retained.body_units(), 16_385);
@@ -76,11 +114,10 @@ fn inherited_boolean_expansion_exhaustion_restores_every_value_binding() {
 
 #[test]
 fn final_boolean_syntax_exhaustion_retains_the_complete_value_region() {
-    let operands = xor_tree("t", 5462)
-        .replace('^', "&&")
-        .replacen('t', "!t", 1);
-    let original = format!("fn f(p:bool)->bool{{let t=p;!({operands})}}");
-    let inline = format!("fn f(p:bool)->bool{{!({})}}", operands.replace('t', "p"));
+    let (operands, params) = distinct_tree("&&", "!t", 5462);
+    let (inline_operands, _) = distinct_tree("&&", "!p", 5462);
+    let original = format!("fn f(p:bool{params})->bool{{let t=p;!({operands})}}");
+    let inline = format!("fn f(p:bool{params})->bool{{!({inline_operands})}}");
     let retained = form(&original);
     assert_ne!(retained, form(&inline));
     assert_eq!(retained.body_units(), 10_930);

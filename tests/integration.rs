@@ -541,6 +541,664 @@ fn threshold_builder_narrows_groups() {
     assert_eq!(report.groups.len(), 1);
 }
 
+const MACROVEC_FIXTURE: &str = "tests/fixtures/macrovecws";
+
+#[test]
+fn qualified_custom_macros_keep_their_comma_in_doctests() {
+    let report = Echoes::default().run(MACROVEC_FIXTURE).unwrap();
+    assert_eq!((report.total, report.unique), (4, 3));
+    assert_eq!(report.groups.len(), 1);
+    let group = &report.groups[0];
+    assert_eq!(group.kind, echoes::Kind::Doctest);
+    let items: Vec<&str> = group.sites.iter().map(|s| s.item.as_str()).collect();
+    assert_eq!(
+        items,
+        vec!["macrovecws::Standard", "macrovecws::StandardComma"]
+    );
+}
+
+#[test]
+fn qualified_custom_macros_keep_their_comma_in_functions() {
+    let report = Echoes::default()
+        .functions()
+        .fn_min_tokens(0)
+        .run(MACROVEC_FIXTURE)
+        .unwrap();
+    assert_eq!((report.functions, report.unique_functions), (4, 3));
+    let function_groups = report
+        .groups
+        .iter()
+        .filter(|g| g.kind == echoes::Kind::Function)
+        .collect::<Vec<_>>();
+    assert_eq!(function_groups.len(), 1);
+    let group = function_groups[0];
+    let items: Vec<&str> = group.sites.iter().map(|s| s.item.as_str()).collect();
+    assert_eq!(
+        items,
+        vec!["macrovecws::equal_first", "macrovecws::equal_second"]
+    );
+    assert_eq!(group.remedy, Some(Remedy::Delete));
+}
+
+const TAILRETURN_FIXTURE: &str = "tests/fixtures/tailreturnws";
+
+#[test]
+fn destructor_sensitive_tail_returns_do_not_group_in_doctests() {
+    let report = Echoes::default().run(TAILRETURN_FIXTURE).unwrap();
+    assert_eq!((report.total, report.unique), (4, 3));
+    assert_eq!(report.groups.len(), 1);
+    let group = &report.groups[0];
+    assert_eq!(group.kind, echoes::Kind::Doctest);
+    let items: Vec<&str> = group.sites.iter().map(|s| s.item.as_str()).collect();
+    assert_eq!(
+        items,
+        vec!["tailreturnws::PlainReturn", "tailreturnws::PlainTail"]
+    );
+    for candidate in &report.groups {
+        let items: Vec<&str> = candidate.sites.iter().map(|s| s.item.as_str()).collect();
+        assert!(
+            !items.contains(&"tailreturnws::GuardReturn")
+                || !items.contains(&"tailreturnws::GuardTail"),
+            "the destructor-sensitive return and tail forms must not group"
+        );
+    }
+}
+
+#[test]
+fn destructor_sensitive_tail_returns_do_not_group_in_functions() {
+    let report = Echoes::default()
+        .functions()
+        .fn_min_tokens(0)
+        .run(TAILRETURN_FIXTURE)
+        .unwrap();
+    assert_eq!((report.functions, report.unique_functions), (6, 5));
+    let function_groups = report
+        .groups
+        .iter()
+        .filter(|g| g.kind == echoes::Kind::Function)
+        .collect::<Vec<_>>();
+    assert_eq!(function_groups.len(), 1);
+    let group = function_groups[0];
+    let items: Vec<&str> = group.sites.iter().map(|s| s.item.as_str()).collect();
+    assert_eq!(
+        items,
+        vec!["tailreturnws::equal_first", "tailreturnws::equal_second"]
+    );
+    assert_eq!(group.remedy, Some(Remedy::Delete));
+}
+
+const REFLEXIVE_FIXTURE: &str = "tests/fixtures/reflexivews";
+
+#[test]
+fn reflexive_doctests_group_only_proven_primitive_comparisons() {
+    let report = Echoes::default().run(REFLEXIVE_FIXTURE).unwrap();
+    let mut groups: Vec<Vec<&str>> = report
+        .groups
+        .iter()
+        .map(|group| {
+            assert_eq!(group.kind, echoes::Kind::Doctest);
+            group.sites.iter().map(|site| site.item.as_str()).collect()
+        })
+        .collect();
+    for group in &mut groups {
+        group.sort_unstable();
+    }
+    assert_eq!(
+        groups,
+        [vec!["reflexivews::Folded", "reflexivews::Written"]]
+    );
+}
+
+#[test]
+fn reflexive_functions_keep_float_partial_and_custom_equality_separate() {
+    let report = Echoes::default()
+        .functions()
+        .fn_min_tokens(0)
+        .run(REFLEXIVE_FIXTURE)
+        .unwrap();
+    let mut groups: Vec<Vec<&str>> = report
+        .groups
+        .iter()
+        .filter(|group| group.kind == echoes::Kind::Function)
+        .map(|group| group.sites.iter().map(|site| site.item.as_str()).collect())
+        .collect();
+    for group in &mut groups {
+        group.sort_unstable();
+    }
+    assert_eq!(
+        groups,
+        [vec!["reflexivews::folded", "reflexivews::written"]]
+    );
+}
+
+const XOR_FIXTURE: &str = "tests/fixtures/xorws";
+
+/// The function groups of a report, member-sorted and group-sorted.
+fn function_groups(report: &Report) -> Vec<Vec<&str>> {
+    let mut groups: Vec<Vec<&str>> = report
+        .groups
+        .iter()
+        .filter(|group| group.kind == echoes::Kind::Function)
+        .map(|group| group.sites.iter().map(|site| site.item.as_str()).collect())
+        .collect();
+    for group in &mut groups {
+        group.sort_unstable();
+    }
+    groups.sort_unstable();
+    groups
+}
+
+#[test]
+fn xor_doctests_group_only_the_proven_primitive_cancellations() {
+    let report = Echoes::default().run(XOR_FIXTURE).unwrap();
+    assert_eq!(report.total, 16);
+    assert_eq!(report.unique, 11);
+    let mut groups: Vec<Vec<&str>> = report
+        .groups
+        .iter()
+        .map(|group| {
+            assert_eq!(group.kind, echoes::Kind::Doctest);
+            group.sites.iter().map(|site| site.item.as_str()).collect()
+        })
+        .collect();
+    for group in &mut groups {
+        group.sort_unstable();
+    }
+    groups.sort_unstable();
+    assert_eq!(
+        groups,
+        [
+            vec!["xorws::BoolFalse", "xorws::BoolWritten"],
+            vec!["xorws::Chain", "xorws::Remaining"],
+            vec![
+                "xorws::LiteralIdentity",
+                "xorws::OddWritten",
+                "xorws::Plain"
+            ],
+            vec!["xorws::Written", "xorws::Zero"],
+        ]
+    );
+}
+
+#[test]
+fn xor_doctest_groups_carry_their_normalized_token_size() {
+    let report = Echoes::default().run(XOR_FIXTURE).unwrap();
+    for group in &report.groups {
+        assert_eq!(
+            group.tokens,
+            if group.sites.iter().any(|site| site.item == "xorws::Chain") {
+                15
+            } else {
+                11
+            }
+        );
+    }
+    let kept = Echoes::default().min_tokens(12).run(XOR_FIXTURE).unwrap();
+    let mut groups: Vec<Vec<&str>> = kept
+        .groups
+        .iter()
+        .map(|group| group.sites.iter().map(|site| site.item.as_str()).collect())
+        .collect();
+    for group in &mut groups {
+        group.sort_unstable();
+    }
+    groups.sort_unstable();
+    assert_eq!(groups, [vec!["xorws::Chain", "xorws::Remaining"]]);
+    assert_eq!(
+        Echoes::default()
+            .min_tokens(16)
+            .run(XOR_FIXTURE)
+            .unwrap()
+            .groups
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn xor_functions_keep_the_unproven_cancellations_separate() {
+    let report = Echoes::default()
+        .functions()
+        .fn_min_tokens(0)
+        .run(XOR_FIXTURE)
+        .unwrap();
+    assert_eq!(
+        function_groups(&report),
+        [
+            vec!["xorws::boolean::folded", "xorws::boolean::written"],
+            vec!["xorws::chain", "xorws::remaining"],
+            vec![
+                "xorws::literal_identity",
+                "xorws::odd_written",
+                "xorws::plain"
+            ],
+            vec!["xorws::written", "xorws::zero"],
+        ]
+    );
+}
+
+#[test]
+fn xor_function_groups_carry_their_normalized_body_size() {
+    let kept = Echoes::default()
+        .functions()
+        .fn_min_tokens(1)
+        .run(XOR_FIXTURE)
+        .unwrap();
+    assert_eq!(
+        function_groups(&kept),
+        [
+            vec!["xorws::boolean::folded", "xorws::boolean::written"],
+            vec!["xorws::chain", "xorws::remaining"],
+            vec![
+                "xorws::literal_identity",
+                "xorws::odd_written",
+                "xorws::plain"
+            ],
+            vec!["xorws::written", "xorws::zero"],
+        ]
+    );
+    assert!(
+        kept.groups
+            .iter()
+            .filter(|group| group.kind == echoes::Kind::Function)
+            .all(|group| group.tokens == 1)
+    );
+    let dropped = Echoes::default()
+        .functions()
+        .fn_min_tokens(2)
+        .run(XOR_FIXTURE)
+        .unwrap();
+    assert!(
+        dropped
+            .groups
+            .iter()
+            .all(|group| group.kind != echoes::Kind::Function)
+    );
+}
+
+const WRAPPING_FIXTURE: &str = "tests/fixtures/wrappingws";
+
+/// The doctest groups of a report, member-sorted and group-sorted.
+fn doctest_groups(report: &Report) -> Vec<Vec<&str>> {
+    let mut groups: Vec<Vec<&str>> = report
+        .groups
+        .iter()
+        .filter(|group| group.kind == echoes::Kind::Doctest)
+        .map(|group| group.sites.iter().map(|site| site.item.as_str()).collect())
+        .collect();
+    for group in &mut groups {
+        group.sort_unstable();
+    }
+    groups.sort_unstable();
+    groups
+}
+
+#[test]
+fn wrapping_add_doctests_group_only_the_proven_native_operand_orders() {
+    let report = Echoes::default().run(WRAPPING_FIXTURE).unwrap();
+    assert_eq!(report.total, 14);
+    assert_eq!(report.unique, 11);
+    assert!(
+        report
+            .groups
+            .iter()
+            .all(|group| group.kind == echoes::Kind::Doctest)
+    );
+    assert_eq!(
+        doctest_groups(&report),
+        [
+            vec!["wrappingws::LiteralReordered", "wrappingws::LiteralWritten"],
+            vec!["wrappingws::Reordered", "wrappingws::Written"],
+            vec!["wrappingws::SignedReordered", "wrappingws::SignedWritten"],
+        ]
+    );
+}
+
+#[test]
+fn wrapping_add_doctest_groups_carry_their_source_token_size() {
+    let report = Echoes::default().run(WRAPPING_FIXTURE).unwrap();
+    for group in &report.groups {
+        let literal = group
+            .sites
+            .iter()
+            .any(|site| site.item == "wrappingws::LiteralWritten");
+        assert_eq!(group.tokens, if literal { 14 } else { 18 });
+    }
+    let kept = Echoes::default()
+        .min_tokens(15)
+        .run(WRAPPING_FIXTURE)
+        .unwrap();
+    assert_eq!(
+        doctest_groups(&kept),
+        [
+            vec!["wrappingws::Reordered", "wrappingws::Written"],
+            vec!["wrappingws::SignedReordered", "wrappingws::SignedWritten"],
+        ]
+    );
+    let dropped = Echoes::default()
+        .min_tokens(19)
+        .run(WRAPPING_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn wrapping_add_functions_keep_custom_effectful_and_other_operations_separate() {
+    let report = Echoes::default()
+        .functions()
+        .fn_min_tokens(0)
+        .run(WRAPPING_FIXTURE)
+        .unwrap();
+    let expected = [
+        vec![
+            "wrappingws::literal_reordered",
+            "wrappingws::literal_written",
+        ],
+        vec!["wrappingws::reordered", "wrappingws::written"],
+        vec![
+            "wrappingws::signed::reordered",
+            "wrappingws::signed::written",
+        ],
+    ];
+    assert_eq!(function_groups(&report), expected);
+    let kept = Echoes::default()
+        .functions()
+        .fn_min_tokens(4)
+        .run(WRAPPING_FIXTURE)
+        .unwrap();
+    assert_eq!(function_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .functions()
+        .fn_min_tokens(5)
+        .run(WRAPPING_FIXTURE)
+        .unwrap();
+    assert_eq!(function_groups(&dropped).len(), 0);
+}
+
+const BOOLEAN_MATCH_FIXTURE: &str = "tests/fixtures/boolmatchws";
+
+#[test]
+fn boolean_match_doctests_group_only_the_proven_conditional_forms() {
+    let report = Echoes::default().run(BOOLEAN_MATCH_FIXTURE).unwrap();
+    assert_eq!(report.total, 8);
+    assert_eq!(report.unique, 6);
+    assert_eq!(
+        doctest_groups(&report),
+        [vec![
+            "boolmatchws::Conditional",
+            "boolmatchws::Matched",
+            "boolmatchws::Reversed",
+        ]]
+    );
+    let group = &report.groups[0];
+    let kept = Echoes::default()
+        .min_tokens(group.tokens)
+        .run(BOOLEAN_MATCH_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), doctest_groups(&report));
+    let dropped = Echoes::default()
+        .min_tokens(group.tokens + 1)
+        .run(BOOLEAN_MATCH_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn boolean_match_functions_keep_wildcards_and_effects_separate() {
+    let expected = [vec![
+        "boolmatchws::conditional",
+        "boolmatchws::matched",
+        "boolmatchws::reversed",
+    ]];
+    for tokens in [0, 5] {
+        let report = Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(BOOLEAN_MATCH_FIXTURE)
+            .unwrap();
+        assert_eq!(function_groups(&report), expected);
+    }
+    let dropped = Echoes::default()
+        .functions()
+        .fn_min_tokens(6)
+        .run(BOOLEAN_MATCH_FIXTURE)
+        .unwrap();
+    assert_eq!(function_groups(&dropped).len(), 0);
+}
+
+const CONCAT_FIXTURE: &str = "tests/fixtures/concatws";
+
+#[test]
+fn concat_doctests_group_only_the_built_in_string_literal_forms() {
+    let report = Echoes::default().run(CONCAT_FIXTURE).unwrap();
+    assert_eq!(report.total, 7);
+    assert_eq!(report.unique, 5);
+    let expected = [vec![
+        "concatws::Concatenated",
+        "concatws::Escaped",
+        "concatws::Literal",
+    ]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(11)
+        .run(CONCAT_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(12)
+        .run(CONCAT_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn concat_functions_keep_non_string_arguments_separate() {
+    let expected = [vec![
+        "concatws::concatenated",
+        "concatws::escaped",
+        "concatws::literal",
+    ]];
+    for tokens in [0, 1] {
+        let report = Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(CONCAT_FIXTURE)
+            .unwrap();
+        assert_eq!(function_groups(&report), expected);
+    }
+    let dropped = Echoes::default()
+        .functions()
+        .fn_min_tokens(2)
+        .run(CONCAT_FIXTURE)
+        .unwrap();
+    assert_eq!(function_groups(&dropped).len(), 0);
+}
+
+const BOOLEAN_LITERAL_FIXTURE: &str = "tests/fixtures/boollitws";
+
+#[test]
+fn boolean_literal_doctests_group_only_the_proven_negations() {
+    let report = Echoes::default().run(BOOLEAN_LITERAL_FIXTURE).unwrap();
+    assert_eq!(report.total, 6);
+    assert_eq!(report.unique, 4);
+    let expected = [vec![
+        "boollitws::Compared",
+        "boollitws::Negated",
+        "boollitws::Reversed",
+    ]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(12)
+        .run(BOOLEAN_LITERAL_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(13)
+        .run(BOOLEAN_LITERAL_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn boolean_literal_functions_keep_effects_and_polarity_separate() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(BOOLEAN_LITERAL_FIXTURE)
+            .unwrap()
+    };
+    let negations = vec![
+        "boollitws::compared",
+        "boollitws::negated",
+        "boollitws::reversed",
+    ];
+    let identities = vec!["boollitws::identity", "boollitws::kept"];
+    for tokens in [0, 1] {
+        assert_eq!(
+            function_groups(&scan(tokens)),
+            [negations.clone(), identities.clone()]
+        );
+    }
+    assert_eq!(function_groups(&scan(2)), [negations]);
+    assert_eq!(function_groups(&scan(3)).len(), 0);
+}
+
+const BOOLEAN_LOGIC_FIXTURE: &str = "tests/fixtures/boollogicws";
+
+#[test]
+fn boolean_logic_doctests_group_only_the_proven_conjunctions() {
+    let report = Echoes::default().run(BOOLEAN_LOGIC_FIXTURE).unwrap();
+    assert_eq!(report.total, 6);
+    assert_eq!(report.unique, 4);
+    let expected = [vec![
+        "boollogicws::Commuted",
+        "boollogicws::Conditional",
+        "boollogicws::Padded",
+    ]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(18)
+        .run(BOOLEAN_LOGIC_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(19)
+        .run(BOOLEAN_LOGIC_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn boolean_logic_functions_keep_effects_and_operators_separate() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(BOOLEAN_LOGIC_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec![
+        "boollogicws::commuted",
+        "boollogicws::conditional",
+        "boollogicws::padded",
+    ]];
+    for tokens in [0, 3] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(4)).len(), 0);
+}
+
+const COMPOUND_FIXTURE: &str = "tests/fixtures/compoundws";
+
+#[test]
+fn compound_doctests_group_only_the_proven_local_targets() {
+    let report = Echoes::default().run(COMPOUND_FIXTURE).unwrap();
+    assert_eq!(report.total, 5);
+    assert_eq!(report.unique, 3);
+    let expected = [vec![
+        "compoundws::Compound",
+        "compoundws::Expanded",
+        "compoundws::Reordered",
+    ]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(27)
+        .run(COMPOUND_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(28)
+        .run(COMPOUND_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn compound_functions_keep_field_targets_separate() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(COMPOUND_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec![
+        "compoundws::compound",
+        "compoundws::expanded",
+        "compoundws::reordered",
+    ]];
+    for tokens in [0, 13] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(14)).len(), 0);
+}
+
+const LET_LITERAL_FIXTURE: &str = "tests/fixtures/letlitws";
+
+#[test]
+fn let_literal_doctests_group_only_the_fixed_width_annotations() {
+    let report = Echoes::default().run(LET_LITERAL_FIXTURE).unwrap();
+    assert_eq!(report.total, 5);
+    assert_eq!(report.unique, 3);
+    let expected = [vec![
+        "letlitws::Annotated",
+        "letlitws::Hexadecimal",
+        "letlitws::Suffixed",
+    ]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(22)
+        .run(LET_LITERAL_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(23)
+        .run(LET_LITERAL_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn let_literal_functions_keep_pointer_sized_annotations_separate() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(LET_LITERAL_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec![
+        "letlitws::annotated",
+        "letlitws::hexadecimal",
+        "letlitws::suffixed",
+    ]];
+    for tokens in [0, 12] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(13)).len(), 0);
+}
+
 const CONTEXT_FIXTURE: &str = "tests/fixtures/contextws";
 
 fn context_scan() -> Report {

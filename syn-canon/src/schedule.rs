@@ -19,6 +19,8 @@ use crate::scope::{FreeKey, Ns, PrimTy, unraw};
 
 mod values;
 
+pub(crate) use values::{expression_within_bounds, within_bounds};
+
 /// The graph nodes a region may still be labeled with.
 pub(crate) const MAX_REGION_NODES: usize = 16_384;
 /// The block nesting level a function scope may analyze.
@@ -115,7 +117,8 @@ pub(crate) enum Lbl {
     /// A total bitwise or valid shift over proven scalars.
     Op(char, Box<Lbl>, Box<Lbl>, PrimTy),
     /// A flattened bitwise chain: one operator and type, sorted leaves,
-    /// multiplicity retained, literal leaves folded.
+    /// multiplicity retained, literal leaves folded. The `WRAPPING_ADD`
+    /// tag holds the sorted operand pair of one native integer call.
     Flat(char, Vec<Lbl>, PrimTy),
     /// Any other expression, by a kind tag and its ordered children.
     Other(String, Vec<Lbl>),
@@ -510,6 +513,35 @@ pub(crate) fn is_assign_op(op: syn::BinOp) -> bool {
     )
 }
 
+/// The plain operator a compound assignment applies to a target of the proven fixed-width
+/// integer or `bool` type `prim`, when the operand is a proven value the native operator
+/// accepts: any proven integer as a shift amount, a value of `prim` otherwise.
+pub(crate) fn compound_operator(op: syn::BinOp, prim: PrimTy, operand: &Lbl) -> Option<syn::BinOp> {
+    let plain = match op {
+        syn::BinOp::AddAssign(_) => syn::BinOp::Add(syn::token::Plus::default()),
+        syn::BinOp::SubAssign(_) => syn::BinOp::Sub(syn::token::Minus::default()),
+        syn::BinOp::MulAssign(_) => syn::BinOp::Mul(syn::token::Star::default()),
+        syn::BinOp::DivAssign(_) => syn::BinOp::Div(syn::token::Slash::default()),
+        syn::BinOp::RemAssign(_) => syn::BinOp::Rem(syn::token::Percent::default()),
+        syn::BinOp::BitAndAssign(_) => syn::BinOp::BitAnd(syn::token::And::default()),
+        syn::BinOp::BitOrAssign(_) => syn::BinOp::BitOr(syn::token::Or::default()),
+        syn::BinOp::BitXorAssign(_) => syn::BinOp::BitXor(syn::token::Caret::default()),
+        syn::BinOp::ShlAssign(_) => syn::BinOp::Shl(syn::token::Shl::default()),
+        syn::BinOp::ShrAssign(_) => syn::BinOp::Shr(syn::token::Shr::default()),
+        _ => return None,
+    };
+    if prim == PrimTy::Bool && BitwiseOp::from_bin_op(plain).is_none() {
+        return None;
+    }
+    let accepted = if matches!(plain, syn::BinOp::Shl(_) | syn::BinOp::Shr(_)) {
+        matches!(operand, Lbl::Int(_, None)) || matches!(operand.prim(), Some(PrimTy::Int { .. }))
+    } else {
+        operand.prim() == Some(prim)
+            || matches!(prim, PrimTy::Int { .. }) && matches!(operand, Lbl::Int(_, None))
+    };
+    accepted.then_some(plain)
+}
+
 /// The kind tag of a binary operator the labels keep distinct.
 fn op_text(op: syn::BinOp) -> String {
     match op {
@@ -665,21 +697,14 @@ fn comparison(bin_op: syn::BinOp, left: &Lbl, right: &Lbl) -> Option<TotalBinary
     })
 }
 
-/// Negate a total boolean label without changing logical operand order, a
-/// comparison of integers or booleans turning into its complement.
+/// Negate a total boolean label, a comparison of integers or booleans turning into its
+/// complement and a logical chain into the canonical chain of its dual operator.
 pub(crate) fn not_label(operand: Lbl) -> Lbl {
     match operand {
         Lbl::Not(inner) => *inner,
         Lbl::Bool(value) => Lbl::Bool(!value),
-        Lbl::Op(tag @ ('∧' | '∨'), mut left, mut right, _) => {
-            *left = not_label(*left);
-            *right = not_label(*right);
-            Lbl::Op(
-                if tag == '∧' { '∨' } else { '∧' },
-                left,
-                right,
-                PrimTy::Bool,
-            )
+        Lbl::Op(tag @ ('∧' | '∨'), left, right, _) => {
+            logical_label(dual(tag), not_label(*left), not_label(*right))
         }
         Lbl::Op('<', left, right, prim) => Lbl::Op('≤', right, left, prim),
         Lbl::Op('≤', left, right, prim) => Lbl::Op('<', right, left, prim),
@@ -694,19 +719,127 @@ pub(crate) fn positive_condition(cond: &Lbl) -> Option<Lbl> {
     matches!(cond, Lbl::Op('≤' | '!', ..)).then(|| not_label(cond.clone()))
 }
 
-/// The total boolean operand compared with literal `true`.
-pub(crate) fn true_comparison(bin_op: syn::BinOp, left: &Lbl, right: &Lbl) -> Option<Lbl> {
-    if !matches!(bin_op, syn::BinOp::Eq(_)) {
-        return None;
-    }
-    match (left, right) {
-        (other, Lbl::Bool(true)) | (Lbl::Bool(true), other)
-            if other.prim() == Some(PrimTy::Bool) =>
-        {
-            Some(other.clone())
-        }
+/// The label tag of `&&` or `||`.
+pub(crate) fn logical_tag(bin_op: syn::BinOp) -> Option<char> {
+    match bin_op {
+        syn::BinOp::And(_) => Some('∧'),
+        syn::BinOp::Or(_) => Some('∨'),
         _ => None,
     }
+}
+
+/// The other logical operator, which De Morgan's laws exchange under negation.
+pub(crate) fn dual(tag: char) -> char {
+    if tag == '∧' { '∨' } else { '∧' }
+}
+
+/// Put the operands of one chain of `&&` or `||` over total booleans in label order. With
+/// `reduce`, repeated operands and identity literals leave the chain, and an absorbing literal
+/// or an emptied chain returns the chain's value.
+pub(crate) fn canonical_operands<T>(
+    tag: char,
+    operands: &mut Vec<(Lbl, T)>,
+    reduce: bool,
+) -> Option<bool> {
+    let identity = tag == '∧';
+    if reduce {
+        if operands
+            .iter()
+            .any(|(label, _)| *label == Lbl::Bool(!identity))
+        {
+            return Some(!identity);
+        }
+        operands.retain(|(label, _)| *label != Lbl::Bool(identity));
+    }
+    operands.sort_by(|a, b| a.0.cmp(&b.0));
+    if reduce {
+        operands.dedup_by(|a, b| a.0 == b.0);
+        if operands.is_empty() {
+            return Some(identity);
+        }
+    }
+    None
+}
+
+/// The canonical label of `left` and `right` joined by the logical operator `tag`, nested
+/// chains of the same operator flattened into one.
+pub(crate) fn logical_label(tag: char, left: Lbl, right: Lbl) -> Lbl {
+    fn collect(tag: char, label: Lbl, out: &mut Vec<(Lbl, ())>) {
+        match label {
+            Lbl::Op(inner, left, right, _) if inner == tag => {
+                collect(tag, *left, out);
+                collect(tag, *right, out);
+            }
+            other => out.push((other, ())),
+        }
+    }
+    let mut operands = Vec::new();
+    collect(tag, left, &mut operands);
+    collect(tag, right, &mut operands);
+    if let Some(value) = canonical_operands(tag, &mut operands, true) {
+        return Lbl::Bool(value);
+    }
+    balanced(
+        operands.into_iter().map(|(label, ())| label).collect(),
+        &mut |left, right| Lbl::Op(tag, Box::new(left), Box::new(right), PrimTy::Bool),
+    )
+}
+
+/// Join `items` in order into a balanced binary tree, so a chain of `n` operands nests
+/// `log2(n)` deep.
+pub(crate) fn balanced<T>(mut items: Vec<T>, join: &mut impl FnMut(T, T) -> T) -> T {
+    if items.len() == 1 {
+        return items.pop().expect("one item");
+    }
+    let right = items.split_off(items.len() / 2);
+    let left = balanced(items, join);
+    let right = balanced(right, join);
+    join(left, right)
+}
+
+/// How an equality over total scalar operands reduces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Equality {
+    /// Both operands are the same primitive value.
+    Reflexive,
+    /// One operand is a boolean literal, so the comparison is the other operand, negated when
+    /// `negated` holds.
+    Operand { left: bool, negated: bool },
+}
+
+/// The reduction of `==` or `!=` over total scalar operands.
+pub(crate) fn equality(bin_op: syn::BinOp, left: &Lbl, right: &Lbl) -> Option<Equality> {
+    let unequal = match bin_op {
+        syn::BinOp::Eq(_) => false,
+        syn::BinOp::Ne(_) => true,
+        _ => return None,
+    };
+    if !unequal && left.prim().is_some() && left == right {
+        return Some(Equality::Reflexive);
+    }
+    let (left, literal) = match (left, right) {
+        (other, Lbl::Bool(value)) if other.prim() == Some(PrimTy::Bool) => (true, *value),
+        (Lbl::Bool(value), other) if other.prim() == Some(PrimTy::Bool) => (false, *value),
+        _ => return None,
+    };
+    Some(Equality::Operand {
+        left,
+        negated: literal == unequal,
+    })
+}
+
+/// The label of a reduced equality over total scalar operands.
+pub(crate) fn equality_label(bin_op: syn::BinOp, left: &Lbl, right: &Lbl) -> Option<Lbl> {
+    Some(match equality(bin_op, left, right)? {
+        Equality::Reflexive => Lbl::Bool(true),
+        Equality::Operand {
+            left: kept,
+            negated,
+        } => {
+            let operand = if kept { left } else { right }.clone();
+            if negated { not_label(operand) } else { operand }
+        }
+    })
 }
 
 /// The operands of a flat chain, flattening chains of the same operator
@@ -720,17 +853,51 @@ pub(crate) fn collect_leaves(op: BitwiseOp, prim: PrimTy, lbl: Lbl, out: &mut Ve
     }
 }
 
-/// A flat chain's canonical label, sorted leaves with the literal
-/// subset folded, a lone literal standing for the whole chain.
+/// The canonical value of a primitive flat chain.
 pub(crate) fn flat_label(op: BitwiseOp, prim: PrimTy, mut leaves: Vec<Lbl>) -> Lbl {
     leaves.sort();
-    if op != BitwiseOp::Xor {
+    if op == BitwiseOp::Xor {
+        retain_odd(&mut leaves, PartialEq::eq);
+    } else {
         leaves.dedup();
     }
     fold_literal_leaves(op, prim, &mut leaves);
-    match leaves.as_slice() {
-        [only] => only.clone(),
-        _ => Lbl::Flat(op.tag(), leaves, prim),
+    if op == BitwiseOp::Xor {
+        leaves.retain(|leaf| leaf.literal_bits() != Some(0));
+        if leaves.is_empty() {
+            return literal_label(prim, 0);
+        }
+    }
+    if leaves.len() == 1 {
+        match leaves.pop().expect("a single operand") {
+            Lbl::Int(bits, None) => literal_label(prim, bits),
+            leaf => leaf,
+        }
+    } else {
+        Lbl::Flat(op.tag(), leaves, prim)
+    }
+}
+
+/// Retain odd multiplicities in a sorted chain without cloning its operands.
+pub(crate) fn retain_odd<T>(operands: &mut Vec<T>, mut same: impl FnMut(&T, &T) -> bool) {
+    let mut pending = None;
+    *operands = core::mem::take(operands)
+        .into_iter()
+        .filter_map(|operand| {
+            let Some(previous) = pending.take() else {
+                pending = Some(operand);
+                return None;
+            };
+            if same(&previous, &operand) {
+                None
+            } else {
+                pending = Some(operand);
+                Some(previous)
+            }
+        })
+        .collect();
+    if let Some(last) = pending {
+        operands.push(last);
     }
 }
 
@@ -1114,7 +1281,7 @@ fn label_binary(
     let (right, r_sites) = label_expr(renamer, env, &bin.right, consumer, locals, orders);
     sites.extend(r_sites);
     let label = if bin.attrs.is_empty()
-        && let Some(reduced) = true_comparison(bin.op, &left, &right)
+        && let Some(reduced) = equality_label(bin.op, &left, &right)
     {
         reduced
     } else {
@@ -1122,6 +1289,10 @@ fn label_binary(
             Some(TotalBinary::Ordered {
                 tag: '∧' | '∨', ..
             }) if !bin.attrs.is_empty() => Lbl::Other(op_text(bin.op), vec![left, right]),
+            Some(TotalBinary::Ordered {
+                tag: tag @ ('∧' | '∨'),
+                ..
+            }) => logical_label(tag, left, right),
             Some(TotalBinary::Ordered { tag, reverse, prim }) => {
                 let (lo, hi) = if reverse.is_some() {
                     (right, left)
@@ -1236,9 +1407,6 @@ fn total_helper(
     call: &syn::ExprCall,
 ) -> Option<PrimTy> {
     let facts = renamer.helper_table.get(helper)?;
-    if !call.attrs.is_empty() || !crate::drift::expr_attrs(&call.func).is_empty() {
-        return None;
-    }
     if call.args.len() != facts.params.len() {
         return None;
     }
@@ -1247,11 +1415,14 @@ fn total_helper(
             return None;
         }
     }
-    Some(facts.result)
+    let mut scan = BranchScan::new();
+    scan.visit_expr_call(call);
+    (scan.valid && !scan.attributed).then_some(facts.result)
 }
 
 /// The label of a method call, the receiver's sites marked on its storage,
-/// its arguments in operand order.
+/// its arguments in operand order. A native integer `wrapping_add` over
+/// total operands reads both by value as an unordered pair.
 fn label_method(
     renamer: &Renamer,
     env: &Env<'_>,
@@ -1269,13 +1440,53 @@ fn label_method(
             ..site
         })
         .collect();
-    let mut children = vec![Lbl::Lit(method.method.to_string()), receiver];
+    let mut children = Vec::with_capacity(method.args.len() + 2);
+    children.push(receiver);
     for arg in &method.args {
         let (label, a_sites) = label_expr(renamer, env, arg, consumer, locals, orders);
         children.push(label);
         sites.extend(a_sites);
     }
+    if wrapping_add_shape(method)
+        && let [receiver, argument] = children.as_slice()
+        && let Some(prim) = wrapping_add_prim(receiver, argument)
+    {
+        let argument = children.pop().expect("a wrapping argument");
+        let receiver = children.pop().expect("a wrapping receiver");
+        let label = wrapping_add_label(prim, receiver, argument);
+        sites.clear();
+        value_sites(&label, &mut sites);
+        return (label, sites);
+    }
+    children.insert(0, Lbl::Lit(method.method.to_string()));
     (Lbl::Other("m".into(), children), sites)
+}
+
+/// The `Flat` tag of a native integer `wrapping_add`.
+const WRAPPING_ADD: char = '⊞';
+
+/// An unattributed one-argument `wrapping_add` call without turbofish.
+pub(crate) fn wrapping_add_shape(method: &syn::ExprMethodCall) -> bool {
+    method.attrs.is_empty()
+        && method.turbofish.is_none()
+        && method.args.len() == 1
+        && method.method == "wrapping_add"
+}
+
+/// The fixed-width integer type of a native `wrapping_add`: a proven receiver
+/// type, whose inherent method resolution precedes every trait method, and an
+/// argument of that type.
+pub(crate) fn wrapping_add_prim(receiver: &Lbl, argument: &Lbl) -> Option<PrimTy> {
+    let prim = receiver.prim()?;
+    (matches!(prim, PrimTy::Int { .. }) && scalar_prim(receiver, argument) == Some(prim))
+        .then_some(prim)
+}
+
+/// The unordered operand pair of a native `wrapping_add`.
+pub(crate) fn wrapping_add_label(prim: PrimTy, receiver: Lbl, argument: Lbl) -> Lbl {
+    let mut operands = vec![receiver, argument];
+    operands.sort();
+    Lbl::Flat(WRAPPING_ADD, operands, prim)
 }
 
 /// The label of a reference, its inner sites marked on the referenced
@@ -1352,16 +1563,40 @@ pub(crate) fn branch_value(cond: &Lbl, then: &Lbl, otherwise: &Lbl) -> Option<Lb
         return None;
     }
     match (then, otherwise) {
-        (Lbl::Bool(true), Lbl::Bool(false)) => Some(cond.clone()),
-        (Lbl::Bool(false), Lbl::Bool(true)) => Some(not_label(cond.clone())),
-        _ => {
-            let prim = then.prim().filter(|prim| otherwise.prim() == Some(*prim))?;
-            let children = match positive_condition(cond) {
-                Some(positive) => alloc::vec![positive, otherwise.clone(), then.clone()],
-                None => alloc::vec![cond.clone(), then.clone(), otherwise.clone()],
-            };
-            Some(Lbl::Select(children, prim))
-        }
+        (Lbl::Bool(true), Lbl::Bool(false)) => return Some(cond.clone()),
+        (Lbl::Bool(false), Lbl::Bool(true)) => return Some(not_label(cond.clone())),
+        _ => {}
+    }
+    if let Some((tag, negated, keep_then)) = literal_branch(then, otherwise) {
+        let cond = if negated {
+            not_label(cond.clone())
+        } else {
+            cond.clone()
+        };
+        let operand = if keep_then { then } else { otherwise };
+        return Some(logical_label(tag, cond, operand.clone()));
+    }
+    let prim = then.prim().filter(|prim| otherwise.prim() == Some(*prim))?;
+    let children = match positive_condition(cond) {
+        Some(positive) => alloc::vec![positive, otherwise.clone(), then.clone()],
+        None => alloc::vec![cond.clone(), then.clone(), otherwise.clone()],
+    };
+    Some(Lbl::Select(children, prim))
+}
+
+/// The logical operator an `if` over `bool` branches with one literal branch reads as: its
+/// tag, whether the condition enters negated, and whether the `then` branch is the other
+/// operand.
+pub(crate) fn literal_branch(then: &Lbl, otherwise: &Lbl) -> Option<(char, bool, bool)> {
+    if then.prim() != Some(PrimTy::Bool) || otherwise.prim() != Some(PrimTy::Bool) {
+        return None;
+    }
+    match (then, otherwise) {
+        (_, Lbl::Bool(false)) => Some(('∧', false, true)),
+        (Lbl::Bool(true), _) => Some(('∨', false, false)),
+        (Lbl::Bool(false), _) => Some(('∧', true, false)),
+        (_, Lbl::Bool(true)) => Some(('∨', true, true)),
+        _ => None,
     }
 }
 
@@ -1680,7 +1915,8 @@ fn label_loop(
 }
 
 /// The label of a `match` expression, each arm's pattern bindings fresh
-/// local ports before its guard and body.
+/// local ports before its guard and body. An admitted boolean match takes
+/// the branch value of its conditional form.
 fn label_match_expr(
     renamer: &Renamer,
     env: &Env<'_>,
@@ -1689,6 +1925,11 @@ fn label_match_expr(
     locals: &mut usize,
     orders: Option<&RefCell<FieldOrders>>,
 ) -> (Lbl, Vec<Site>) {
+    if let Some(value) = boolean_match_value(renamer, env, r#match, consumer, locals, orders) {
+        let mut sites = Vec::new();
+        value_sites(&value, &mut sites);
+        return (value, sites);
+    }
     let (scrutinee, mut sites) = label_expr(renamer, env, &r#match.expr, consumer, locals, orders);
     let mut children = vec![scrutinee];
     for arm in &r#match.arms {
@@ -1719,6 +1960,85 @@ fn label_match_expr(
         ));
     }
     (Lbl::Other("match".into(), children), sites)
+}
+
+/// The scrutinee and the `true` and `false` arm bodies of an unattributed,
+/// exhaustive two-arm match over literal boolean patterns.
+pub(crate) fn boolean_match(
+    r#match: &syn::ExprMatch,
+) -> Option<(&syn::Expr, &syn::Expr, &syn::Expr)> {
+    let [first, second] = r#match.arms.as_slice() else {
+        return None;
+    };
+    if !r#match.attrs.is_empty() {
+        return None;
+    }
+    let value = |arm: &syn::Arm| match &arm.pat {
+        syn::Pat::Lit(syn::ExprLit {
+            attrs,
+            lit: syn::Lit::Bool(literal),
+        }) if attrs.is_empty() && arm.attrs.is_empty() => Some(literal.value),
+        _ => None,
+    };
+    let (selected, other) = (value(first)?, value(second)?);
+    if selected == other {
+        return None;
+    }
+    let (then, otherwise) = if selected {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    Some((&r#match.expr, &then.body, &otherwise.body))
+}
+
+/// The single bounded scalar tail of an unattributed arm body.
+fn arm_tail(body: &syn::Expr) -> Option<&syn::Expr> {
+    let mut scan = BranchScan::new();
+    scan.visit_expr(body);
+    if !scan.valid || scan.attributed {
+        return None;
+    }
+    match body {
+        syn::Expr::Block(block) if block.label.is_none() => scalar_tail(&block.block),
+        body => crate::algebra::within_bounds(body).then_some(body),
+    }
+}
+
+/// The branch value of an admitted boolean match, proven like its
+/// conditional form with the scrutinee as the condition.
+pub(crate) fn boolean_match_value(
+    renamer: &Renamer,
+    env: &Env<'_>,
+    r#match: &syn::ExprMatch,
+    consumer: usize,
+    locals: &mut usize,
+    orders: Option<&RefCell<FieldOrders>>,
+) -> Option<Lbl> {
+    let (scrutinee, then, otherwise) = boolean_match(r#match)?;
+    let (positive, negated) = condition_polarity(scrutinee);
+    if !crate::drift::expr_attrs(positive).is_empty() {
+        return None;
+    }
+    let (then, otherwise) = if negated {
+        (otherwise, then)
+    } else {
+        (then, otherwise)
+    };
+    let (then, otherwise) = (arm_tail(then)?, arm_tail(otherwise)?);
+    let saved = *locals;
+    let (cond, _) = label_expr(renamer, env, positive, consumer, locals, orders);
+    let (then, _) = label_expr(renamer, env, then, consumer, locals, orders);
+    let (otherwise, _) = label_expr(renamer, env, otherwise, consumer, locals, orders);
+    let value = if cond.prim() == Some(PrimTy::Bool) {
+        branch_value(&cond, &then, &otherwise)
+    } else {
+        None
+    };
+    if value.is_none() {
+        *locals = saved;
+    }
+    value
 }
 
 /// The label of a closure, its inputs fresh local ports with their proven

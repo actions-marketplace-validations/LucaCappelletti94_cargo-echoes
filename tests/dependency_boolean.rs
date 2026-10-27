@@ -141,10 +141,6 @@ fn demorgan_pushes_into_ordered_operands_of_both_kinds() {
 #[test]
 fn demorgan_guards_keep_order_structure_and_operand_proof() {
     separate(
-        "fn f(a: bool, b: bool) -> bool { !(a && b) }",
-        "fn f(a: bool, b: bool) -> bool { !(b && a) }",
-    );
-    separate(
         "fn f(a: bool, b: bool, c: bool) -> bool { !(a || (b && c)) }",
         "fn f(a: bool, b: bool, c: bool) -> bool { !a || (!b || !c) }",
     );
@@ -176,14 +172,6 @@ fn compare_true_removes_literal_equality_in_both_positions() {
 
 #[test]
 fn compare_true_guards_keep_foreign_and_non_literal_equalities() {
-    separate(
-        "fn f(p: bool) -> bool { p == false }",
-        "fn g(x: bool) -> bool { !x }",
-    );
-    separate(
-        "fn f(p: bool) -> bool { p != true }",
-        "fn g(x: bool) -> bool { !x }",
-    );
     separate(
         "fn f(p: bool, q: bool) -> bool { p == q }",
         "fn g(p: bool, q: bool) -> bool { p }",

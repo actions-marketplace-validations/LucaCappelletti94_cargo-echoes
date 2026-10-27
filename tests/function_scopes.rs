@@ -133,3 +133,427 @@ fn a_super_glob_reads_the_formatting_macros_of_the_parent_module() {
     };
     assert_ne!(past_root("x"), past_root("y"));
 }
+
+#[test]
+fn reflexive_module_views_respect_primitive_shadowing() {
+    let body = |expression: &str| format!("fn f(x: u32) -> bool {{ {expression} }}");
+    assert_eq!(
+        module_view("", &body("x == x")),
+        module_view("", &body("true")),
+    );
+    let root = "#[derive(PartialEq)] pub struct Token;";
+    let shadowed = |expression: &str| format!("use super::Token as u32; {}", body(expression));
+    assert_ne!(
+        module_view(root, &shadowed("x == x")),
+        module_view(root, &shadowed("true")),
+    );
+}
+
+/// The canonical form of the whole file under the compilation-failure mode.
+fn failing_form(source: &str) -> CanonicalForm {
+    syn_canon::canonicalize_failing(
+        syn::parse_str(source).unwrap_or_else(|error| panic!("{source}: {error}")),
+    )
+}
+
+#[test]
+fn proven_reflexive_equalities_fold_in_the_borrowed_view() {
+    assert_eq!(
+        view("fn f(x: u32) -> bool { x == x }"),
+        view("fn f(x: u32) -> bool { true }")
+    );
+    assert_eq!(
+        view("fn f(flag: bool) -> bool { flag == flag }"),
+        view("fn f(flag: bool) -> bool { true }")
+    );
+    assert_eq!(
+        view("fn f(x: u32) -> bool { (x & 7u32) == (x & 7u32) }"),
+        view("fn f(x: u32) -> bool { true }")
+    );
+    assert_eq!(
+        view("fn h(x: u32) -> u32 { x & 7u32 }\nfn f(x: u32) -> bool { h(x) == h(x) }"),
+        view("fn h(x: u32) -> u32 { x & 7u32 }\nfn f(x: u32) -> bool { true }")
+    );
+    assert_eq!(
+        view("fn f(x: u32) -> bool { read(); x == x }"),
+        view("fn f(x: u32) -> bool { read(); true }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_the_reflexive_source_distinction() {
+    assert_ne!(
+        failing_form("fn f(x: u32) -> bool { x == x }"),
+        failing_form("fn f(x: u32) -> bool { true }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_the_reflexive_comparison() {
+    let source = |body: &str| {
+        format!("struct S;\n#[observe]\nimpl S {{\n    fn f(x: u32) -> bool {{ {body} }}\n}}")
+    };
+    assert_ne!(view(&source("x == x")), view(&source("true")));
+}
+
+#[test]
+fn proven_xor_cancellations_fold_in_the_borrowed_view() {
+    assert_eq!(
+        view("fn f(x: u32) -> u32 { x ^ x }"),
+        view("fn f(x: u32) -> u32 { 0u32 }")
+    );
+    assert_eq!(
+        view("fn f(p: bool) -> bool { p ^ p }"),
+        view("fn f(p: bool) -> bool { false }")
+    );
+    assert_eq!(
+        view("fn f(x: u32, y: u32) -> u32 { x ^ y ^ x }"),
+        view("fn f(x: u32, y: u32) -> u32 { y }")
+    );
+    assert_eq!(
+        view("fn f(x: u32) -> u32 { x ^ x ^ x }"),
+        view("fn f(x: u32) -> u32 { x }")
+    );
+    assert_eq!(
+        view("fn f(x: u32) -> u32 { x ^ 0u32 }"),
+        view("fn f(x: u32) -> u32 { x }")
+    );
+    assert_eq!(
+        view("fn f(x: u32) -> u32 { read(); x ^ x }"),
+        view("fn f(x: u32) -> u32 { read(); 0u32 }")
+    );
+    assert_eq!(
+        view("fn h(x: u32) -> u32 { x ^ 7u32 }\nfn f(x: u32) -> u32 { h(x) ^ h(x) }"),
+        view("fn h(x: u32) -> u32 { x ^ 7u32 }\nfn f(x: u32) -> u32 { 0u32 }")
+    );
+}
+
+#[test]
+fn unproven_xor_operands_do_not_cancel_in_the_borrowed_view() {
+    assert_ne!(
+        view("fn f() -> u32 { read() ^ read() }"),
+        view("fn f() -> u32 { 0u32 }")
+    );
+    assert_ne!(
+        view("fn f(x: u32) -> u32 { (1u32 / x) ^ (1u32 / x) }"),
+        view("fn f(x: u32) -> u32 { 0u32 }")
+    );
+    assert_ne!(
+        view("fn f(x: u32, y: u32) -> u32 { x ^ y ^ x }"),
+        view("fn f(x: u32, y: u32) -> u32 { 0u32 }")
+    );
+    let custom = "#[derive(Clone, Copy)] struct T;\nimpl core::ops::BitXor for T {\n    type Output = T;\n    fn bitxor(self, _other: T) -> T { T }\n}\n";
+    assert_ne!(
+        view(&format!("{custom}fn f(x: T) -> T {{ x ^ x }}")),
+        view(&format!("{custom}fn f(x: T) -> T {{ T }}"))
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_the_xor_source_distinction() {
+    assert_ne!(
+        failing_form("fn f(x: u32) -> u32 { x ^ x }"),
+        failing_form("fn f(x: u32) -> u32 { 0u32 }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_the_xor_cancellation() {
+    let source = |body: &str| {
+        format!("struct S;\n#[observe]\nimpl S {{\n    fn f(x: u32) -> u32 {{ {body} }}\n}}")
+    };
+    assert_ne!(view(&source("x ^ x")), view(&source("0u32")));
+}
+
+#[test]
+fn proven_wrapping_add_operands_share_one_order_in_the_borrowed_view() {
+    let body = |expression: &str| format!("fn f(x: u32, y: u32) -> u32 {{ {expression} }}");
+    for (written, reordered) in [
+        ("x.wrapping_add(y)", "y.wrapping_add(x)"),
+        ("x.wrapping_add(7u32)", "7u32.wrapping_add(x)"),
+        ("read(); x.wrapping_add(y)", "read(); y.wrapping_add(x)"),
+    ] {
+        assert_eq!(view(&body(written)), view(&body(reordered)), "{written}");
+    }
+    assert_eq!(
+        view(
+            "fn h(x: u32) -> u32 { x & 7u32 }\nfn f(x: u32, y: u32) -> u32 { h(x).wrapping_add(y) }"
+        ),
+        view(
+            "fn h(x: u32) -> u32 { x & 7u32 }\nfn f(x: u32, y: u32) -> u32 { y.wrapping_add(h(x)) }"
+        )
+    );
+}
+
+#[test]
+fn unproven_wrapping_add_operands_keep_their_order_in_the_borrowed_view() {
+    assert_ne!(
+        view("fn f(x: u32) -> u32 { read().wrapping_add(x) }"),
+        view("fn f(x: u32) -> u32 { x.wrapping_add(read()) }")
+    );
+    let custom = "#[derive(Clone, Copy)] struct T(u32);\nimpl T {\n    fn wrapping_add(self, other: T) -> T { T(self.0.wrapping_sub(other.0)) }\n}\n";
+    assert_ne!(
+        view(&format!(
+            "{custom}fn f(x: T, y: T) -> T {{ x.wrapping_add(y) }}"
+        )),
+        view(&format!(
+            "{custom}fn f(x: T, y: T) -> T {{ y.wrapping_add(x) }}"
+        ))
+    );
+}
+
+#[test]
+fn wrapping_add_module_views_respect_primitive_shadowing() {
+    let body = |expression: &str| format!("fn f(x: u32, y: u32) -> u32 {{ {expression} }}");
+    assert_eq!(
+        module_view("", &body("x.wrapping_add(y)")),
+        module_view("", &body("y.wrapping_add(x)")),
+    );
+    let root = "#[derive(Clone, Copy)] pub struct Token;\nimpl Token { pub fn wrapping_add(self, _: Token) -> Token { Token } }";
+    let shadowed = |expression: &str| format!("use super::Token as u32; {}", body(expression));
+    assert_ne!(
+        module_view(root, &shadowed("x.wrapping_add(y)")),
+        module_view(root, &shadowed("y.wrapping_add(x)")),
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_the_wrapping_add_operand_order() {
+    assert_ne!(
+        failing_form("fn f(x: u32, y: u32) -> u32 { x.wrapping_add(y) }"),
+        failing_form("fn f(x: u32, y: u32) -> u32 { y.wrapping_add(x) }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_the_wrapping_add_operand_order() {
+    let source = |body: &str| {
+        format!(
+            "struct S;\n#[observe]\nimpl S {{\n    fn f(x: u32, y: u32) -> u32 {{ {body} }}\n}}"
+        )
+    };
+    assert_ne!(
+        view(&source("x.wrapping_add(y)")),
+        view(&source("y.wrapping_add(x)"))
+    );
+}
+
+#[test]
+fn proven_boolean_matches_fold_into_the_conditional_in_the_borrowed_view() {
+    let body =
+        |expression: &str| format!("fn f(p: bool, x: u32, y: u32) -> u32 {{ {expression} }}");
+    for (matched, conditional) in [
+        ("match p { true => x, false => y }", "if p { x } else { y }"),
+        ("match p { false => y, true => x }", "if p { x } else { y }"),
+        (
+            "read(); match p { false => y, true => x }",
+            "read(); if p { x } else { y }",
+        ),
+    ] {
+        assert_eq!(view(&body(matched)), view(&body(conditional)), "{matched}");
+    }
+}
+
+#[test]
+fn unproven_boolean_matches_stay_matches_in_the_borrowed_view() {
+    assert_ne!(
+        view("fn f(x: u32, y: u32) -> u32 { match read() { true => x, false => y } }"),
+        view("fn f(x: u32, y: u32) -> u32 { if read() { x } else { y } }")
+    );
+    assert_ne!(
+        view("fn f(p: bool, y: u32) -> u32 { match p { true => read(), false => y } }"),
+        view("fn f(p: bool, y: u32) -> u32 { if p { read() } else { y } }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_the_boolean_match() {
+    assert_ne!(
+        failing_form("fn f(p: bool, x: u32, y: u32) -> u32 { match p { true => x, false => y } }"),
+        failing_form("fn f(p: bool, x: u32, y: u32) -> u32 { if p { x } else { y } }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_the_boolean_match() {
+    let source = |body: &str| {
+        format!(
+            "struct S;\n#[observe]\nimpl S {{\n    fn f(p: bool, x: u32, y: u32) -> u32 {{ {body} }}\n}}"
+        )
+    };
+    assert_ne!(
+        view(&source("match p { true => x, false => y }")),
+        view(&source("if p { x } else { y }"))
+    );
+}
+
+#[test]
+fn proven_literal_comparisons_fold_in_the_borrowed_view() {
+    let body = |expression: &str| format!("fn f(p: bool) -> bool {{ {expression} }}");
+    for (written, folded) in [
+        ("p == false", "!p"),
+        ("true != p", "!p"),
+        ("read(); p != false", "read(); p"),
+    ] {
+        assert_eq!(view(&body(written)), view(&body(folded)), "{written}");
+    }
+}
+
+#[test]
+fn unproven_literal_comparisons_stay_comparisons_in_the_borrowed_view() {
+    assert_ne!(
+        view("fn f(z: Unknown) -> bool { z == false }"),
+        view("fn f(z: Unknown) -> bool { !z }")
+    );
+    assert_ne!(
+        view("fn f() -> bool { read() != true }"),
+        view("fn f() -> bool { !read() }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_the_literal_comparison() {
+    assert_ne!(
+        failing_form("fn f(p: bool) -> bool { p == false }"),
+        failing_form("fn f(p: bool) -> bool { !p }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_the_literal_comparison() {
+    let source = |body: &str| {
+        format!("struct S;\n#[observe]\nimpl S {{\n    fn f(p: bool) -> bool {{ {body} }}\n}}")
+    };
+    assert_ne!(view(&source("p == false")), view(&source("!p")));
+}
+
+#[test]
+fn proven_logical_chains_take_one_form_in_the_borrowed_view() {
+    let body = |expression: &str| format!("fn f(p: bool, q: bool) -> bool {{ {expression} }}");
+    for (written, folded) in [
+        ("q && p", "p && q"),
+        ("if p { q } else { false }", "p && q"),
+        ("p || false || p", "p"),
+        ("read(); q || p", "read(); p || q"),
+    ] {
+        assert_eq!(view(&body(written)), view(&body(folded)), "{written}");
+    }
+}
+
+#[test]
+fn unproven_logical_operands_keep_their_order_in_the_borrowed_view() {
+    assert_ne!(
+        view("fn f(p: bool, z: Unknown) -> bool { z && p }"),
+        view("fn f(p: bool, z: Unknown) -> bool { p && z }")
+    );
+    assert_ne!(
+        view("fn f(p: bool) -> bool { read() && p }"),
+        view("fn f(p: bool) -> bool { p && read() }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_the_logical_operand_order() {
+    assert_ne!(
+        failing_form("fn f(p: bool, q: bool) -> bool { q && p }"),
+        failing_form("fn f(p: bool, q: bool) -> bool { p && q }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_the_logical_operand_order() {
+    let source = |body: &str| {
+        format!(
+            "struct S;\n#[observe]\nimpl S {{\n    fn f(p: bool, q: bool) -> bool {{ {body} }}\n}}"
+        )
+    };
+    assert_ne!(view(&source("q && p")), view(&source("p && q")));
+}
+
+#[test]
+fn proven_compound_assignments_expand_in_the_borrowed_view() {
+    let body = |statements: &str| format!("fn f(mut x: u32, y: u32) -> u32 {{ {statements} x }}");
+    for (written, expanded) in [
+        ("x += y;", "x = x + y;"),
+        ("x <<= 3; x |= y;", "x = x << 3; x = x | y;"),
+        ("read(); x -= y;", "read(); x = x - y;"),
+    ] {
+        assert_eq!(view(&body(written)), view(&body(expanded)), "{written}");
+    }
+}
+
+#[test]
+fn unproven_compound_targets_stay_compound_in_the_borrowed_view() {
+    assert_ne!(
+        view("fn f(mut x: Unknown, y: Unknown) -> Unknown { x += y; x }"),
+        view("fn f(mut x: Unknown, y: Unknown) -> Unknown { x = x + y; x }")
+    );
+    assert_ne!(
+        view("fn f(x: &mut u32, y: u32) { *x += y; }"),
+        view("fn f(x: &mut u32, y: u32) { *x = *x + y; }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_the_compound_assignment() {
+    assert_ne!(
+        failing_form("fn f(mut x: u32, y: u32) -> u32 { x += y; x }"),
+        failing_form("fn f(mut x: u32, y: u32) -> u32 { x = x + y; x }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_the_compound_assignment() {
+    let source = |body: &str| {
+        format!(
+            "struct S;\n#[observe]\nimpl S {{\n    fn f(mut x: u32, y: u32) -> u32 {{ {body} x }}\n}}"
+        )
+    };
+    assert_ne!(view(&source("x += y;")), view(&source("x = x + y;")));
+}
+
+#[test]
+fn stated_let_annotations_drop_in_the_borrowed_view() {
+    let body = |statements: &str| format!("fn f(x: u32) -> u32 {{ {statements} }}");
+    for (annotated, suffixed) in [
+        ("let v: u32 = 5; v ^ x", "let v = 5u32; v ^ x"),
+        (
+            "let mut v: u32 = 0x10; v += x; v",
+            "let mut v = 16u32; v += x; v",
+        ),
+        ("read(); let v: u32 = 1; v", "read(); let v = 1u32; v"),
+    ] {
+        assert_eq!(view(&body(annotated)), view(&body(suffixed)), "{annotated}");
+    }
+}
+
+#[test]
+fn unproven_let_annotations_stay_in_the_borrowed_view() {
+    assert_ne!(
+        view("fn f() -> usize { let v: usize = 5; v }"),
+        view("fn f() -> usize { let v = 5usize; v }")
+    );
+    assert_ne!(
+        view("fn f(x: u32) -> u32 { let v: u32 = x; v }"),
+        view("fn f(x: u32) -> u32 { let v = x; v }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_the_let_annotation() {
+    assert_ne!(
+        failing_form("fn f() -> u32 { let v: u32 = 5; v }"),
+        failing_form("fn f() -> u32 { let v = 5u32; v }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_the_let_annotation() {
+    let source = |body: &str| {
+        format!("struct S;\n#[observe]\nimpl S {{\n    fn f() -> u32 {{ {body} }}\n}}")
+    };
+    assert_ne!(
+        view(&source("let v: u32 = 5; v")),
+        view(&source("let v = 5u32; v"))
+    );
+}

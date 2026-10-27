@@ -254,6 +254,13 @@ fn s04_pr_local_onlynew() {
         Some("REQUEST_CHANGES"),
         "local duplicates keep the existing request-changes behavior"
     );
+    let body = reviews[0]["params"]["body"].as_str().unwrap();
+    assert!(
+        body.contains("https://github.com/LucaCappelletti94/cargo-echoes)")
+            && body.contains("issues/new?template=wrong-review.yml")
+            && body.contains("https://github.com/sponsors/LucaCappelletti94"),
+        "the review body links the project, feedback form and sponsorship"
+    );
     let text = joined_bodies(&r.body_files());
     assert!(
         text.contains("added by this pull request"),
@@ -354,19 +361,9 @@ fn s05_pr_reuse_only() {
     let exit = world.run();
     let r = world.runner();
     assert_eq!(exit, 0, "advisory reuse findings do not fail the run");
-    let reviews = r.review_posts();
-    assert_eq!(
-        reviews.len(),
-        1,
-        "one review is posted for the reuse findings"
-    );
-    assert_eq!(
-        reviews[0]
-            .get("params")
-            .and_then(|p| p.get("event"))
-            .and_then(Value::as_str),
-        Some("COMMENT"),
-        "dependency-only advice posts a comment review, not request changes"
+    assert!(
+        r.review_posts().is_empty(),
+        "advice-only findings need no summary review"
     );
     assert_eq!(
         r.comment_posts().len(),
@@ -379,8 +376,10 @@ fn s05_pr_reuse_only() {
         "reuse advice carries no deletion suggestion"
     );
     assert!(
-        text.contains("can be reused"),
-        "the accessible API alternative is rendered"
+        text.contains(&format!(
+            "{ECHOES} found this code in a dependency. These items match it, the public ones first."
+        )) && text.contains("can be reused"),
+        "the reuse advice names echoes and renders the accessible API alternative"
     );
     assert!(
         text.contains("direct::public::helper"),
@@ -476,15 +475,9 @@ fn s06_pr_context_groups() {
     let exit = world.run();
     let r = world.runner();
     assert_eq!(exit, 0, "the context group run exits 0");
-    let reviews = r.review_posts();
-    assert_eq!(
-        reviews
-            .first()
-            .and_then(|c| c.get("params"))
-            .and_then(|p| p.get("event"))
-            .and_then(Value::as_str),
-        Some("COMMENT"),
-        "context group advice posts a comment review"
+    assert!(
+        r.review_posts().is_empty(),
+        "context advice needs no summary review"
     );
     assert_eq!(
         r.comment_posts().len(),
@@ -493,8 +486,11 @@ fn s06_pr_context_groups() {
     );
     let text = joined_bodies(&r.body_files());
     assert!(
-        text.contains("repeated in this scan"),
-        "the context advice is neutral"
+        text.contains(&format!(
+            "{ECHOES} found this code at the places below too. A shared helper could hold it once."
+        )) && text
+            .contains("Check that the copies agree in types and behaviour before sharing them."),
+        "the context advice names echoes and reads plainly"
     );
     assert!(
         !text.contains("```suggestion"),
@@ -1083,16 +1079,11 @@ fn s15_prepare_post_reuse_only() {
     let exit2 = world2.run();
     let r2 = world2.runner();
     assert_eq!(exit2, 0, "the reuse-only post run exits 0");
-    let reviews = r2.review_posts();
-    assert_eq!(
-        reviews
-            .first()
-            .and_then(|c| c.get("params"))
-            .and_then(|p| p.get("event"))
-            .and_then(Value::as_str),
-        Some("COMMENT"),
-        "dependency-only advice never triggers request changes through post"
+    assert!(
+        r2.review_posts().is_empty() && r2.comment_posts().len() == 1,
+        "dependency-only advice posts its inline entry and no summary review through post"
     );
+    assert_eq!(r2.status(), "posted", "the inline advice counts as posted");
 }
 
 #[test]
@@ -1253,6 +1244,46 @@ fn s18_perm_403_readonly() {
 }
 
 #[test]
+fn review_fallback_links_feedback_without_phantom_overflow() {
+    for code in ["422", "500"] {
+        let mut world = World::pull_request(&format!("review-fallback-{code}"))
+            .inputs(&[("only-new", "false")])
+            .json(report(
+                &[],
+                &[ctx_group(
+                    "c1",
+                    "C1",
+                    &[
+                        site("src/lib.rs", 3, 6, "app::original"),
+                        site("src/parser.rs", 10, 14, "app::copy"),
+                    ],
+                )],
+                None,
+                6,
+                3,
+            ))
+            .changed(&["src/parser.rs"])
+            .env("SCEN_GH_FAIL", code);
+        assert_eq!(world.run(), 0);
+        let reviews = world.runner().review_posts();
+        let body = reviews[0]["params"]["body"].as_str().unwrap();
+        assert!(body.contains("src/parser.rs:10-14"));
+        assert!(
+            !body.contains("/actions/runs/"),
+            "a complete fallback list needs no overflow link"
+        );
+        assert!(
+            body.contains("issues/new?template=wrong-review.yml")
+                && body.contains("review=https%3A%2F%2Fgithub.com%2Fowner%2Frepo%2Fpull%2F7")
+                && body.contains("src%2Fparser.rs%3A10%20%20app%3A%3Acopy")
+                && body.contains("https://github.com/sponsors/LucaCappelletti94")
+                && body.contains("[echoes](https://github.com/LucaCappelletti94/cargo-echoes)"),
+            "fallback feedback identifies the pull request and reported sites"
+        );
+    }
+}
+
+#[test]
 fn s19_oor_truncation() {
     let mut sites = Vec::new();
     for i in 0..800 {
@@ -1294,6 +1325,14 @@ fn s19_oor_truncation() {
     assert!(
         body.contains("more, they are in the run summary") && body.contains("src/lib.rs"),
         "the truncated list points at the run summary"
+    );
+    let listed = body
+        .lines()
+        .filter(|line| line.starts_with("- group "))
+        .count();
+    assert!(
+        body.contains(&format!("and {} more,", sites.len() - 1 - listed)),
+        "the overflow count includes only sites absent from the review"
     );
 }
 
@@ -1439,6 +1478,239 @@ fn post_world(name: &str, prepared: &World, event: &str, inputs: &[(&str, &str)]
         .base_sha(&base)
         .head_sha(&head)
         .changed(&changed)
+}
+
+fn copy_payload(prepared: &World, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    let source = prepared.workspace_path().join("echoes-payload");
+    for file in ["meta.json", "report.json", "base-report.json", "blank.txt"] {
+        if source.join(file).is_file() {
+            fs::copy(source.join(file), destination.join(file)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn post_collection_posts_seven_workspaces_with_independent_caps() {
+    let prep = prepared("collection-seven", 4, "app::parse", "doctest");
+    let root = prep.workspace_path().join("payloads");
+    let mut changed = Vec::new();
+    for workspace in [
+        "connetto-web",
+        "dioxus-demo",
+        "root",
+        "tauri-leptos-demo",
+        "wasm-smoke",
+        "webauthn-unlock",
+        "yew-web-demo",
+    ] {
+        let child = root.join(format!("echoes-payload-{workspace}"));
+        copy_payload(&prep, &child);
+        let mut meta: Value =
+            serde_json::from_str(&fs::read_to_string(child.join("meta.json")).unwrap()).unwrap();
+        meta["scope"] = json!(workspace);
+        fs::write(child.join("meta.json"), meta.to_string()).unwrap();
+        let mut report: Value =
+            serde_json::from_str(&fs::read_to_string(child.join("report.json")).unwrap()).unwrap();
+        for site in report["groups"][0]["sites"].as_array_mut().unwrap() {
+            let file = format!("{workspace}/{}", site["file"].as_str().unwrap());
+            changed.push(file.clone());
+            site["file"] = json!(file);
+        }
+        fs::write(child.join("report.json"), report.to_string()).unwrap();
+    }
+    let changed: Vec<&str> = changed.iter().map(String::as_str).collect();
+    let mut post = post_world(
+        "collection-seven-post",
+        &prep,
+        "workflow_run",
+        &[("payload", "payloads"), ("max-comments", "1")],
+    )
+    .changed(&changed);
+    assert_eq!(post.run(), 0);
+    let comments = post.runner().comment_posts();
+    let reviews = post.runner().review_posts();
+    assert_eq!(comments.len(), 7);
+    assert_eq!(reviews.len(), 7);
+    let posted_paths: std::collections::BTreeSet<&str> = comments
+        .iter()
+        .map(|comment| comment["params"]["path"].as_str().unwrap())
+        .collect();
+    let expected_paths = changed
+        .iter()
+        .copied()
+        .filter(|path| path.ends_with("/src/c1.rs"))
+        .collect();
+    assert_eq!(posted_paths, expected_paths);
+    for review in reviews {
+        assert_eq!(review["params"]["event"], "REQUEST_CHANGES");
+        assert!(
+            review["params"]["body"]
+                .as_str()
+                .unwrap()
+                .contains("2 inline copies were not posted")
+        );
+    }
+}
+
+#[test]
+fn post_collection_rejects_bad_siblings_and_posts_the_others() {
+    let prep = prepared("collection-validation", 2, "app::parse", "doctest");
+    let root = prep.workspace_path().join("payloads");
+    for name in [
+        "00-valid",
+        "01-pr",
+        "02-head",
+        "03-report",
+        "04-size",
+        "05-missing",
+        "99-valid",
+    ] {
+        copy_payload(&prep, &root.join(name));
+    }
+    for (name, field, value) in [("01-pr", "pr", "99"), ("02-head", "head_sha", "bad")] {
+        let path = root.join(name).join("meta.json");
+        let mut meta: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        meta[field] = json!(value);
+        fs::write(path, meta.to_string()).unwrap();
+    }
+    fs::write(root.join("03-report/report.json"), r#"{"groups": false}"#).unwrap();
+    fs::File::create(root.join("04-size/blank.txt"))
+        .unwrap()
+        .set_len(PAYLOAD_LIMIT + 1)
+        .unwrap();
+    fs::remove_file(root.join("05-missing/meta.json")).unwrap();
+    let mut post = post_world(
+        "collection-validation-post",
+        &prep,
+        "workflow_run",
+        &[("payload", "payloads")],
+    );
+    assert_eq!(post.run(), 1);
+    assert_eq!(post.runner().review_posts().len(), 2);
+    assert_eq!(post.runner().comment_posts().len(), 2);
+    let out = post
+        .runner()
+        .step_stdout("Review the findings on the pull request")
+        .unwrap();
+    for name in ["01-pr", "02-head", "03-report", "04-size", "05-missing"] {
+        assert!(out.contains(name), "{out}");
+    }
+}
+
+#[test]
+fn post_collection_bounds_candidates_before_posting() {
+    let prep = prepared("collection-limit", 2, "app::parse", "doctest");
+    let root = prep.workspace_path().join("payloads");
+    for i in 0..64 {
+        copy_payload(&prep, &root.join(format!("{i:02}")));
+    }
+    let mut allowed = post_world(
+        "collection-64",
+        &prep,
+        "workflow_run",
+        &[("payload", "payloads")],
+    )
+    .open_prs(json!([]));
+    assert_eq!(allowed.run(), 0);
+    assert_eq!(posts(allowed.runner()), 0);
+    copy_payload(&prep, &root.join("65"));
+    let mut overflow = post_world(
+        "collection-65",
+        &prep,
+        "workflow_run",
+        &[("payload", "payloads")],
+    );
+    assert_eq!(overflow.run(), 1);
+    assert_eq!(posts(overflow.runner()), 0);
+    let out = overflow
+        .runner()
+        .step_stdout("Review the findings on the pull request")
+        .unwrap();
+    assert!(out.contains("payloads") && out.contains("64"), "{out}");
+}
+
+#[test]
+fn post_collection_does_not_recurse_into_grandchildren() {
+    let prep = prepared("collection-depth", 2, "app::parse", "doctest");
+    let root = prep.workspace_path().join("payloads");
+    copy_payload(&prep, &root.join("valid"));
+    copy_payload(&prep, &root.join("incomplete/nested"));
+    let mut post = post_world(
+        "collection-depth-post",
+        &prep,
+        "workflow_run",
+        &[("payload", "payloads")],
+    );
+    assert_eq!(post.run(), 1);
+    assert_eq!(post.runner().review_posts().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn post_collection_ignores_symlinks_and_treats_names_as_data() {
+    let prep = prepared("collection-names", 2, "app::parse", "doctest");
+    let root = prep.workspace_path().join("payloads");
+    let name = "-$(touch OWNED)\n::error::injected";
+    copy_payload(&prep, &root.join(name));
+    copy_payload(&prep, &root.join(".hidden"));
+    fs::write(root.join("ordinary-file"), "ignored").unwrap();
+    std::os::unix::fs::symlink(
+        prep.workspace_path().join("echoes-payload"),
+        root.join("link"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("missing", root.join("broken-link")).unwrap();
+    let mut post = post_world(
+        "collection-names-post",
+        &prep,
+        "workflow_run",
+        &[("payload", "payloads")],
+    );
+    assert_eq!(post.run(), 0);
+    assert_eq!(post.runner().review_posts().len(), 2);
+    assert!(!prep.workspace_path().join("OWNED").exists());
+    let out = post
+        .runner()
+        .step_stdout("Review the findings on the pull request")
+        .unwrap();
+    assert!(
+        !out.lines()
+            .any(|line| line.starts_with("::error::injected")),
+        "{out}"
+    );
+}
+
+#[test]
+fn post_collection_empty_or_missing_directory_names_the_root() {
+    let prep = prepared("collection-empty", 2, "app::parse", "doctest");
+    for name in ["empty", "missing"] {
+        if name == "empty" {
+            fs::create_dir_all(prep.workspace_path().join(name)).unwrap();
+            fs::write(
+                prep.workspace_path().join(name).join("ordinary-file"),
+                "ignored",
+            )
+            .unwrap();
+        }
+        let mut post = post_world(name, &prep, "workflow_run", &[("payload", name)]);
+        assert_eq!(post.run(), 1);
+        assert_eq!(posts(post.runner()), 0);
+        let out = post
+            .runner()
+            .step_stdout("Review the findings on the pull request")
+            .unwrap();
+        assert!(out.contains(name), "{out}");
+    }
+}
+
+#[test]
+fn post_collection_root_metadata_takes_precedence() {
+    let prep = prepared("collection-root", 2, "app::parse", "doctest");
+    fs::create_dir_all(prep.workspace_path().join("echoes-payload/invalid-child")).unwrap();
+    let mut post = post_world("collection-root-post", &prep, "workflow_run", &[]);
+    assert_eq!(post_status(&mut post), (0, "posted".into()));
+    assert_eq!(post.runner().review_posts().len(), 1);
 }
 
 #[test]
@@ -2244,6 +2516,7 @@ fn review_marker(scope: &str) -> String {
 const CONTEXT_NOTE: &str =
     "This context is repeated in this scan. A shared helper can carry it once.";
 const LEGACY_OOR: &str = "These duplicates are not on lines GitHub shows in this pull request diff, the inline comment cannot attach there. The links point at the copies on the head commit.";
+const ECHOES: &str = "[echoes](https://github.com/LucaCappelletti94/cargo-echoes)";
 const BOT: &str = "github-actions[bot]";
 const DUP_KEY: &str = "doctest%3AH1%3Asrc%2Fdup.rs%3Aapp%3A%3Aparse";
 
@@ -2319,6 +2592,7 @@ fn s60_clean_head_resolves_gone_threads_and_dismisses_reviews() {
                 &format!("{LEGACY_OOR}\n\n- group context  `sub/src/lib.rs:3`  `x`")
             ),
             review(104, "COMMENTED", BOT, &review_marker(".")),
+            review(108, "COMMENTED", BOT, ""),
             review(105, "CHANGES_REQUESTED", BOT, &review_marker("sub")),
             review(106, "CHANGES_REQUESTED", "luca", ""),
             review(
@@ -2342,9 +2616,37 @@ fn s60_clean_head_resolves_gone_threads_and_dismisses_reviews() {
         ["101", "102", "107"],
         "only this workspace's requests for changes are dismissed"
     );
+    assert_clean_summaries(r);
     assert!(
         r.comment_posts().is_empty() && r.review_posts().is_empty(),
         "a clean head posts nothing"
+    );
+}
+
+/// Asserts a clean head dismissed with the clean message and rewrote only review 104.
+fn assert_clean_summaries(r: &Runner) {
+    assert!(
+        r.dismissal_messages()
+            .iter()
+            .all(|m| m.starts_with("No echoes finding of this workspace remains at ")),
+        "a clean head dismisses with the clean message: {:?}",
+        r.dismissal_messages()
+    );
+    let rewritten = r.rewritten_reviews();
+    assert_eq!(
+        rewritten
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["104"],
+        "only this workspace's comment-only summary is rewritten, never an inline comment's review"
+    );
+    assert!(
+        rewritten[0].1.starts_with(&format!(
+            "No {ECHOES} finding of this workspace remains at `"
+        )) && rewritten[0].1.ends_with(&review_marker(".")),
+        "the rewritten summary says no finding remains and keeps its mark: {}",
+        rewritten[0].1
     );
 }
 
@@ -2389,6 +2691,12 @@ fn s61_threaded_finding_is_not_posted_again() {
         // The listing already holds the review this run posts, id 9001, which must stay.
         .reviews(json!([
             review(201, "CHANGES_REQUESTED", BOT, &review_marker(".")),
+            review(
+                202,
+                "COMMENTED",
+                BOT,
+                &format!("x\n\n{}", review_marker("."))
+            ),
             review(9001, "CHANGES_REQUESTED", BOT, &review_marker(".")),
         ]));
     assert_eq!(world.run(), 0, "the review run exits 0");
@@ -2411,13 +2719,7 @@ fn s61_threaded_finding_is_not_posted_again() {
         reviews[0].pointer("/params/event").and_then(Value::as_str),
         Some("REQUEST_CHANGES")
     );
-    assert!(
-        reviews[0]
-            .pointer("/params/body")
-            .and_then(Value::as_str)
-            .is_some_and(|b| b.contains(&review_marker("."))),
-        "the renewed review carries its workspace mark"
-    );
+    assert_renewed_summary(r, &reviews[0]);
     assert_eq!(
         r.dismissed_reviews(),
         ["201"],
@@ -2431,6 +2733,33 @@ fn s61_threaded_finding_is_not_posted_again() {
     assert!(
         posted < dismissed,
         "the new review is posted before the old one is dismissed"
+    );
+}
+
+/// Asserts the renewed review's lead and footer and the superseded rewrite of review 202.
+fn assert_renewed_summary(r: &Runner, review: &Value) {
+    let body = review
+        .pointer("/params/body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        body.starts_with(&format!(
+            "{ECHOES} still finds the duplicates it reported on earlier commits"
+        )) && body.contains(&review_marker(".")),
+        "the renewed review names echoes in its lead and carries its workspace mark: {body}"
+    );
+    assert!(
+        !body.contains(&format!("{ECHOES} ·")),
+        "the footer does not repeat the echoes link: {body}"
+    );
+    let rewritten = r.rewritten_reviews();
+    assert!(
+        rewritten.len() == 1
+            && rewritten[0].0 == "202"
+            && rewritten[0]
+                .1
+                .starts_with(&format!("Superseded by the {ECHOES} review of `")),
+        "the earlier comment-only summary is marked superseded: {rewritten:?}"
     );
 }
 
@@ -2516,6 +2845,11 @@ fn s63_context_out_of_range_links_and_requests_nothing() {
             && body.contains("/src/mod.rs#L10-L13)"),
         "the out-of-range copy links its lines: {body}"
     );
+    assert!(
+        body.starts_with(&format!("{ECHOES} found repeated code in this pull request.\n\nThese duplicates are on lines this diff does not show, so they have no inline comment. The links point at the head commit."))
+            && !body.contains(&format!("{ECHOES} ·")),
+        "the summary names echoes once, in its lead: {body}"
+    );
 }
 
 #[test]
@@ -2541,6 +2875,137 @@ fn s64_refused_resolution_leaves_a_notice() {
         .unwrap_or_default();
     assert!(
         out.contains("contents: write"),
+        "the notice names the missing permission: {out}"
+    );
+}
+
+/// The context world of `s06`, whose one inline finding is keyed by `CTX_KEY`.
+fn advice_world(name: &str) -> World {
+    World::pull_request(name)
+        .inputs(&[("context-select", "crate:app")])
+        .git()
+        .json(report(
+            &[],
+            &[ctx_group(
+                "c9f8",
+                "C1",
+                &[
+                    site("src/parser.rs", 3, 6, "app::parser::selected"),
+                    site("src/mod.rs", 10, 13, "app::other::selected"),
+                ],
+            )],
+            None,
+            6,
+            3,
+        ))
+        .base_json(report(&[], &[], None, 6, 3))
+        .changed(&["Cargo.toml", "src/lib.rs", "src/parser.rs", "src/mod.rs"])
+        .extra_base("src/mod.rs", SRC_PARSER)
+}
+
+const CTX_KEY: &str = "context%3AC1%3Asrc%2Fmod.rs%3Aapp%3A%3Aother%3A%3Aselected";
+
+/// The earlier echoes summaries of this workspace, one of each state.
+fn earlier_summaries() -> Value {
+    json!([
+        review(301, "CHANGES_REQUESTED", BOT, &review_marker(".")),
+        review(
+            302,
+            "COMMENTED",
+            BOT,
+            &format!("x\n\n{}", review_marker("."))
+        ),
+    ])
+}
+
+/// Asserts the earlier summaries were cleaned up while advice findings remain.
+fn assert_advice_cleanup(r: &Runner) {
+    assert!(
+        r.review_posts().is_empty(),
+        "advice findings need no summary review"
+    );
+    assert_eq!(
+        r.dismissed_reviews(),
+        ["301"],
+        "the earlier request is dismissed"
+    );
+    assert!(
+        r.dismissal_messages()[0]
+            .starts_with("No echoes finding of this workspace requests changes at "),
+        "the dismissal says nothing requests changes: {:?}",
+        r.dismissal_messages()
+    );
+    let rewritten = r.rewritten_reviews();
+    assert!(
+        rewritten.len() == 1
+            && rewritten[0].0 == "302"
+            && rewritten[0].1.starts_with(&format!(
+                "The open {ECHOES} threads carry the findings that remain at `"
+            ))
+            && rewritten[0].1.ends_with(&review_marker(".")),
+        "the earlier comment-only summary points at the open threads: {rewritten:?}"
+    );
+}
+
+#[test]
+fn s70_new_advice_cleans_up_without_a_summary() {
+    let mut world = advice_world("s70").reviews(earlier_summaries());
+    assert_eq!(world.run(), 0, "the advice run exits 0");
+    let r = world.runner();
+    assert_eq!(r.comment_posts().len(), 1, "the advice is posted inline");
+    assert_eq!(r.status(), "posted", "the inline advice counts as posted");
+    assert_advice_cleanup(r);
+}
+
+#[test]
+fn s71_remaining_advice_cleans_up_without_a_summary() {
+    let mut world = advice_world("s71")
+        .threads(json!([thread(
+            "t1",
+            false,
+            "src/mod.rs",
+            None,
+            "github-actions",
+            &format!("x\n\n{}", thread_marker(".", CTX_KEY))
+        )]))
+        .reviews(earlier_summaries());
+    assert_eq!(world.run(), 0, "the remaining-advice run exits 0");
+    let r = world.runner();
+    assert!(
+        r.comment_posts().is_empty() && r.resolved_threads().is_empty(),
+        "the threaded advice is neither posted again nor resolved"
+    );
+    assert_advice_cleanup(r);
+}
+
+#[test]
+fn s72_comment_summary_rewrite_is_idempotent_and_refusal_is_reported() {
+    let head = "1111111111111111111111111111111111111111";
+    let settled = format!(
+        "No {ECHOES} finding of this workspace remains at `{head}`.\n\n{}",
+        review_marker(".")
+    );
+    let mut world = World::pull_request("s72a")
+        .json(report(&[], &[], None, 6, 3))
+        .head_sha(head)
+        .reviews(json!([review(401, "COMMENTED", BOT, &settled)]));
+    assert_eq!(world.run(), 0, "a clean run exits 0");
+    assert!(
+        world.runner().rewritten_reviews().is_empty(),
+        "a summary already saying the same is left alone"
+    );
+    let mut refused = World::pull_request("s72b")
+        .json(report(&[], &[], None, 6, 3))
+        .head_sha(head)
+        .reviews(json!([review(402, "COMMENTED", BOT, &review_marker("."))]))
+        .env("SCEN_GH_REVIEW_EDIT_403", "1");
+    assert_eq!(refused.run(), 0, "a refused rewrite does not fail the run");
+    let out = refused
+        .runner()
+        .step_stdout("Review the findings on the pull request")
+        .unwrap_or_default();
+    assert!(
+        out.contains("rewriting a review needs pull-requests: write"),
         "the notice names the missing permission: {out}"
     );
 }
