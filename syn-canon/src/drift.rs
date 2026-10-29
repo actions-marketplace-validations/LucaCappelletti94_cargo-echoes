@@ -159,6 +159,8 @@ struct Drift<'a> {
     file_rebound: u64,
     /// The std name bindings of the scopes around the current node, innermost last.
     std_scopes: Vec<StdScope>,
+    /// The generic parameters in scope, outermost first, each a lifetime or not with its name.
+    generic_names: Vec<(bool, String)>,
     helpers: Option<&'a mut crate::helpers::HelperSyntax>,
 }
 
@@ -227,6 +229,9 @@ impl VisitMut for Drift<'_> {
             false,
         ));
         syn::visit_mut::visit_block_mut(self, block);
+        if self.compiles {
+            discard_call_bindings(&mut block.stmts);
+        }
         self.std_scopes.pop();
     }
 
@@ -280,7 +285,7 @@ impl VisitMut for Drift<'_> {
         if self.compiles
             && let syn::Expr::Match(expr_match) = expr
         {
-            join_equal_arms(expr_match);
+            join_equal_arms(expr_match, &|_| false);
         }
         if let syn::Expr::Closure(closure) = expr {
             let protected_inputs = closure
@@ -311,11 +316,33 @@ impl VisitMut for Drift<'_> {
                 ret.expr = None;
             }
             match expr {
-                syn::Expr::Closure(closure) => closure.inputs.iter_mut().for_each(drop_binding_mut),
-                syn::Expr::ForLoop(for_loop) => drop_binding_mut(&mut for_loop.pat),
+                syn::Expr::Closure(closure) => {
+                    closure.inputs.iter_mut().for_each(drop_binding_mut);
+                    if closure.asyncness.is_none()
+                        && let syn::Expr::Block(body) = closure.body.as_mut()
+                        && body.attrs.is_empty()
+                        && body.label.is_none()
+                    {
+                        guard_clauses(&mut body.block.stmts, &returns);
+                    }
+                }
+                syn::Expr::ForLoop(for_loop) => {
+                    drop_binding_mut(&mut for_loop.pat);
+                    let label = for_loop.label.as_ref().map(|label| &label.name);
+                    guard_clauses(&mut for_loop.body.stmts, &|stmt| continues(stmt, label));
+                }
+                syn::Expr::While(while_loop) => {
+                    let label = while_loop.label.as_ref().map(|label| &label.name);
+                    guard_clauses(&mut while_loop.body.stmts, &|stmt| continues(stmt, label));
+                }
+                syn::Expr::Loop(plain) => {
+                    let label = plain.label.as_ref().map(|label| &label.name);
+                    guard_clauses(&mut plain.body.stmts, &|stmt| continues(stmt, label));
+                }
                 syn::Expr::Let(expr_let) => drop_binding_mut(&mut expr_let.pat),
                 _ => {}
             }
+            loop_as_while(expr);
         }
         fold_signed_zero(expr);
         if self.compiles {
@@ -456,6 +483,13 @@ impl VisitMut for Drift<'_> {
             self.observed().visit_generics_mut(generics);
             return;
         }
+        for param in &generics.params {
+            self.generic_names.push(match param {
+                syn::GenericParam::Type(param) => (false, param.ident.to_string()),
+                syn::GenericParam::Const(param) => (false, param.ident.to_string()),
+                syn::GenericParam::Lifetime(param) => (true, param.lifetime.ident.to_string()),
+            });
+        }
         syn::visit_mut::visit_generics_mut(self, generics);
         bounds_to_where(generics);
         generics.params.pop_punct();
@@ -473,13 +507,14 @@ impl VisitMut for Drift<'_> {
             }
         }
         if self.compiles {
-            sort_bounds(generics);
+            sort_bounds(generics, &self.generic_names);
         }
     }
 
     fn visit_item_trait_mut(&mut self, node: &mut syn::ItemTrait) {
         syn::visit_mut::visit_item_trait_mut(self, node);
         drop_trailing_plus(&mut node.supertraits);
+        self.sort_bound_list(&mut node.supertraits);
     }
 
     fn visit_item_trait_alias_mut(&mut self, node: &mut syn::ItemTraitAlias) {
@@ -498,21 +533,25 @@ impl VisitMut for Drift<'_> {
     fn visit_trait_item_type_mut(&mut self, node: &mut syn::TraitItemType) {
         syn::visit_mut::visit_trait_item_type_mut(self, node);
         drop_trailing_plus(&mut node.bounds);
+        self.sort_bound_list(&mut node.bounds);
     }
 
     fn visit_type_impl_trait_mut(&mut self, node: &mut syn::TypeImplTrait) {
         syn::visit_mut::visit_type_impl_trait_mut(self, node);
         drop_trailing_plus(&mut node.bounds);
+        self.sort_bound_list(&mut node.bounds);
     }
 
     fn visit_type_trait_object_mut(&mut self, node: &mut syn::TypeTraitObject) {
         syn::visit_mut::visit_type_trait_object_mut(self, node);
         drop_trailing_plus(&mut node.bounds);
+        self.sort_bound_list(&mut node.bounds);
     }
 
     fn visit_constraint_mut(&mut self, node: &mut syn::Constraint) {
         syn::visit_mut::visit_constraint_mut(self, node);
         drop_trailing_plus(&mut node.bounds);
+        self.sort_bound_list(&mut node.bounds);
     }
 
     fn visit_type_reference_mut(&mut self, node: &mut syn::TypeReference) {
@@ -535,6 +574,9 @@ impl VisitMut for Drift<'_> {
     fn visit_item_impl_mut(&mut self, node: &mut syn::ItemImpl) {
         for attr in &mut node.attrs {
             self.visit_attribute_mut(attr);
+        }
+        if self.compiles {
+            elide_impl_lifetimes(node);
         }
         self.visit_generics_mut(&mut node.generics);
         let outer = core::mem::replace(&mut self.in_impl_header, true);
@@ -568,6 +610,9 @@ impl VisitMut for Drift<'_> {
         syn::visit_mut::visit_item_fn_mut(self, node);
         if self.compiles {
             elide_lifetimes(&mut node.sig, Some(&node.block));
+            if node.sig.asyncness.is_none() {
+                guard_clauses(&mut node.block.stmts, &returns);
+            }
         }
     }
 
@@ -575,6 +620,9 @@ impl VisitMut for Drift<'_> {
         syn::visit_mut::visit_impl_item_fn_mut(self, node);
         if self.compiles {
             elide_lifetimes(&mut node.sig, Some(&node.block));
+            if node.sig.asyncness.is_none() {
+                guard_clauses(&mut node.block.stmts, &returns);
+            }
         }
     }
 
@@ -582,6 +630,11 @@ impl VisitMut for Drift<'_> {
         syn::visit_mut::visit_trait_item_fn_mut(self, node);
         if self.compiles {
             elide_lifetimes(&mut node.sig, node.default.as_ref());
+            if node.sig.asyncness.is_none()
+                && let Some(body) = &mut node.default
+            {
+                guard_clauses(&mut body.stmts, &returns);
+            }
         }
     }
 
@@ -613,7 +666,9 @@ impl VisitMut for Drift<'_> {
         if let Some(attrs) = item_attrs(item) {
             strip_inert_attrs(attrs);
         }
+        let depth = self.generic_names.len();
         syn::visit_mut::visit_item_mut(self, item);
+        self.generic_names.truncate(depth);
     }
 
     fn visit_impl_item_mut(&mut self, item: &mut syn::ImplItem) {
@@ -629,7 +684,9 @@ impl VisitMut for Drift<'_> {
             return;
         }
         strip_inert_attrs(attrs);
+        let depth = self.generic_names.len();
         syn::visit_mut::visit_impl_item_mut(self, item);
+        self.generic_names.truncate(depth);
     }
 
     fn visit_trait_item_mut(&mut self, item: &mut syn::TraitItem) {
@@ -645,7 +702,9 @@ impl VisitMut for Drift<'_> {
             return;
         }
         strip_inert_attrs(attrs);
+        let depth = self.generic_names.len();
         syn::visit_mut::visit_trait_item_mut(self, item);
+        self.generic_names.truncate(depth);
     }
 
     fn visit_foreign_item_mut(&mut self, item: &mut syn::ForeignItem) {
@@ -660,7 +719,9 @@ impl VisitMut for Drift<'_> {
             self.observed().visit_foreign_item_mut(item);
             return;
         }
+        let depth = self.generic_names.len();
         syn::visit_mut::visit_foreign_item_mut(self, item);
+        self.generic_names.truncate(depth);
     }
 
     fn visit_field_mut(&mut self, field: &mut syn::Field) {
@@ -683,13 +744,13 @@ impl VisitMut for Drift<'_> {
 
     fn visit_expr_macro_mut(&mut self, node: &mut syn::ExprMacro) {
         normalize_macro_delim(&mut node.mac);
-        inline_format_args(&mut node.mac, self.rebound_names());
+        inline_format_args(&mut node.mac, self.rebound_names(), self.compiles);
         syn::visit_mut::visit_expr_macro_mut(self, node);
     }
 
     fn visit_stmt_macro_mut(&mut self, node: &mut syn::StmtMacro) {
         normalize_macro_delim(&mut node.mac);
-        inline_format_args(&mut node.mac, self.rebound_names());
+        inline_format_args(&mut node.mac, self.rebound_names(), self.compiles);
         syn::visit_mut::visit_stmt_macro_mut(self, node);
     }
 
@@ -765,6 +826,16 @@ impl Drift<'_> {
                 supers: 0,
             }]),
             ..Drift::default()
+        }
+    }
+
+    /// Sort a bound list outside a `where` clause by the `where` clause key, when compiling.
+    fn sort_bound_list(
+        &self,
+        bounds: &mut syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    ) {
+        if self.compiles {
+            sort_bound_slice(bounds, &self.generic_names);
         }
     }
 
@@ -944,16 +1015,177 @@ fn collapse_else_if(expr_if: &mut syn::ExprIf) {
     }
 }
 
+/// Read the first `if p { S; jump }` of `stmts` whose rest `R` ends in a statement and declares
+/// no item as `if p { S } else { R }`, then the guards of `S` and `R`. In a unit body the jump is
+/// `return;`, and in a loop body a `continue` of that loop, so both forms run `S` or `R` and then
+/// leave the block. The rest keeps the locals and the temporary scopes of its statements.
+fn guard_clauses(stmts: &mut Vec<syn::Stmt>, jump: &dyn Fn(&syn::Stmt) -> bool) {
+    let Some(index) = (0..stmts.len())
+        .find(|&index| guard(&mut stmts[index], jump).is_some() && settled(&stmts[index + 1..]))
+    else {
+        return;
+    };
+    let mut rest = stmts.split_off(index + 1);
+    guard_clauses(&mut rest, jump);
+    let (branch, semi) = stmts
+        .last_mut()
+        .and_then(|stmt| guard(stmt, jump))
+        .expect("the guard at the found index");
+    branch.then_branch.stmts.pop();
+    guard_clauses(&mut branch.then_branch.stmts, jump);
+    *semi = None;
+    if branch.then_branch.stmts.is_empty() {
+        negate_condition(&mut branch.cond);
+        branch.then_branch.stmts = rest;
+        return;
+    }
+    branch.else_branch = Some((
+        syn::token::Else::default(),
+        Box::new(syn::Expr::Block(syn::ExprBlock {
+            attrs: Vec::new(),
+            label: None,
+            block: syn::Block {
+                brace_token: syn::token::Brace::default(),
+                stmts: rest,
+            },
+        })),
+    ));
+    collapse_else_if(branch);
+}
+
+/// Replace `cond` by its negation, unwrapping an unattributed `!`.
+fn negate_condition(cond: &mut syn::Expr) {
+    let inner = core::mem::replace(cond, syn::Expr::Verbatim(TokenStream::new()));
+    *cond = match inner {
+        syn::Expr::Unary(unary)
+            if unary.attrs.is_empty() && matches!(unary.op, syn::UnOp::Not(_)) =>
+        {
+            *unary.expr
+        }
+        inner => syn::Expr::Unary(syn::ExprUnary {
+            attrs: Vec::new(),
+            op: syn::UnOp::Not(syn::token::Not::default()),
+            expr: Box::new(inner),
+        }),
+    };
+}
+
+/// The `if` of `stmt` and its semicolon when `stmt` is an unattributed `if` without `else` and
+/// without a `let` condition whose block ends in `jump`.
+fn guard<'a>(
+    stmt: &'a mut syn::Stmt,
+    jump: &dyn Fn(&syn::Stmt) -> bool,
+) -> Option<(&'a mut syn::ExprIf, &'a mut Option<syn::token::Semi>)> {
+    match stmt {
+        syn::Stmt::Expr(syn::Expr::If(branch), semi)
+            if branch.attrs.is_empty()
+                && branch.else_branch.is_none()
+                && !binds(&branch.cond)
+                && branch.then_branch.stmts.last().is_some_and(jump) =>
+        {
+            Some((branch, semi))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a condition holds a `let`, alone or in an `&&` chain.
+fn binds(cond: &syn::Expr) -> bool {
+    match cond {
+        syn::Expr::Let(_) => true,
+        syn::Expr::Binary(binary) if matches!(binary.op, syn::BinOp::And(_)) => {
+            binds(&binary.left) || binds(&binary.right)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the statements after a guard exist, end in a statement and declare no item, so
+/// moving them into an `else` block changes neither a tail temporary nor a name in view.
+fn settled(rest: &[syn::Stmt]) -> bool {
+    rest.last().is_some_and(|last| match last {
+        syn::Stmt::Expr(_, semi) => semi.is_some(),
+        syn::Stmt::Macro(mac) => mac.semi_token.is_some(),
+        _ => true,
+    }) && !rest.iter().any(|stmt| matches!(stmt, syn::Stmt::Item(_)))
+}
+
+/// Whether `stmt` is an unattributed `return` without a value.
+fn returns(stmt: &syn::Stmt) -> bool {
+    matches!(stmt, syn::Stmt::Expr(syn::Expr::Return(ret), _) if ret.attrs.is_empty() && ret.expr.is_none())
+}
+
+/// Whether `stmt` is an unattributed `continue` of the loop labelled `label`.
+fn continues(stmt: &syn::Stmt, label: Option<&syn::Lifetime>) -> bool {
+    matches!(
+        stmt,
+        syn::Stmt::Expr(syn::Expr::Continue(jump), _)
+            if jump.attrs.is_empty()
+                && jump.label.as_ref().is_none_or(|name| Some(name) == label)
+    )
+}
+
+/// Read `loop { if p { break; } R }` as `while !p { R }` when the `break` leaves that loop
+/// without a value and `R` declares no item. Both forms test `p` before each run of `R`.
+fn loop_as_while(expr: &mut syn::Expr) {
+    let syn::Expr::Loop(plain) = expr else {
+        return;
+    };
+    let label = plain.label.as_ref().map(|label| &label.name);
+    let breaks = |stmt: &syn::Stmt| {
+        matches!(
+            stmt,
+            syn::Stmt::Expr(syn::Expr::Break(jump), _)
+                if jump.attrs.is_empty()
+                    && jump.expr.is_none()
+                    && jump.label.as_ref().is_none_or(|name| Some(name) == label)
+        )
+    };
+    let Some((first, rest)) = plain.body.stmts.split_first_mut() else {
+        return;
+    };
+    if rest.iter().any(|stmt| matches!(stmt, syn::Stmt::Item(_))) {
+        return;
+    }
+    let Some((branch, _)) =
+        guard(first, &breaks).filter(|(branch, _)| branch.then_branch.stmts.len() == 1)
+    else {
+        return;
+    };
+    let cond = core::mem::replace(
+        &mut branch.cond,
+        Box::new(syn::Expr::Verbatim(TokenStream::new())),
+    );
+    plain.body.stmts.remove(0);
+    *expr = syn::Expr::While(syn::ExprWhile {
+        attrs: core::mem::take(&mut plain.attrs),
+        label: plain.label.take(),
+        while_token: syn::token::While::default(),
+        cond: Box::new(syn::Expr::Unary(syn::ExprUnary {
+            attrs: Vec::new(),
+            op: syn::UnOp::Not(syn::token::Not::default()),
+            expr: cond,
+        })),
+        body: syn::Block {
+            brace_token: syn::token::Brace::default(),
+            stmts: core::mem::take(&mut plain.body.stmts),
+        },
+    });
+}
+
 /// Adjacent unattributed arms whose patterns bind nothing and whose bodies spell the same tokens
 /// join into one arm of an or-pattern, which `match` tries in the same order. An identifier
-/// pattern may be a binding, so it keeps its arm.
-fn join_equal_arms(expr_match: &mut syn::ExprMatch) {
+/// pattern may be a binding, so it keeps its arm unless `unit` proves it names a variant.
+pub(crate) fn join_equal_arms(
+    expr_match: &mut syn::ExprMatch,
+    unit: &dyn Fn(&syn::PatIdent) -> bool,
+) {
     use quote::ToTokens as _;
     let arms = core::mem::take(&mut expr_match.arms);
     let mut joined: Vec<syn::Arm> = Vec::with_capacity(arms.len());
     let mut previous: Option<String> = None;
     for arm in arms {
-        let body = (arm.attrs.is_empty() && binding_free(&arm.pat))
+        let body = (arm.attrs.is_empty() && binding_free(&arm.pat, unit))
             .then(|| arm.body.to_token_stream().to_string());
         if let Some(last) = joined.last_mut()
             && body.is_some()
@@ -987,31 +1219,29 @@ fn join_alternative(into: &mut syn::Pat, pat: syn::Pat) {
     *into = syn::Pat::Or(joined);
 }
 
-/// Whether an unattributed pattern binds no name and names no identifier that could be one.
-/// Drift has already removed unattributed parentheses.
-fn binding_free(pat: &syn::Pat) -> bool {
+/// Whether an unattributed pattern binds no name and names no identifier that could be one, an
+/// identifier `unit` proves a variant aside. Drift has already removed unattributed parentheses.
+fn binding_free(pat: &syn::Pat, unit: &dyn Fn(&syn::PatIdent) -> bool) -> bool {
+    let free = |pat: &syn::Pat| binding_free(pat, unit);
     match pat {
         syn::Pat::Lit(lit) => lit.attrs.is_empty(),
         syn::Pat::Range(range) => range.attrs.is_empty(),
         syn::Pat::Wild(wild) => wild.attrs.is_empty(),
         syn::Pat::Rest(rest) => rest.attrs.is_empty(),
         syn::Pat::Path(path) => path.attrs.is_empty(),
-        syn::Pat::Reference(reference) => {
-            reference.attrs.is_empty() && binding_free(&reference.pat)
-        }
-        syn::Pat::Or(or) => or.attrs.is_empty() && or.cases.iter().all(binding_free),
-        syn::Pat::Tuple(tuple) => tuple.attrs.is_empty() && tuple.elems.iter().all(binding_free),
-        syn::Pat::Slice(slice) => slice.attrs.is_empty() && slice.elems.iter().all(binding_free),
-        syn::Pat::TupleStruct(tuple) => {
-            tuple.attrs.is_empty() && tuple.elems.iter().all(binding_free)
-        }
+        syn::Pat::Ident(ident) => unit(ident),
+        syn::Pat::Reference(reference) => reference.attrs.is_empty() && free(&reference.pat),
+        syn::Pat::Or(or) => or.attrs.is_empty() && or.cases.iter().all(free),
+        syn::Pat::Tuple(tuple) => tuple.attrs.is_empty() && tuple.elems.iter().all(free),
+        syn::Pat::Slice(slice) => slice.attrs.is_empty() && slice.elems.iter().all(free),
+        syn::Pat::TupleStruct(tuple) => tuple.attrs.is_empty() && tuple.elems.iter().all(free),
         syn::Pat::Struct(pat) => {
             pat.attrs.is_empty()
                 && pat.rest.as_ref().is_none_or(|rest| rest.attrs.is_empty())
                 && pat
                     .fields
                     .iter()
-                    .all(|field| field.attrs.is_empty() && binding_free(&field.pat))
+                    .all(|field| field.attrs.is_empty() && free(&field.pat))
         }
         _ => false,
     }
@@ -1025,6 +1255,32 @@ fn drop_empty_stmts(stmts: &mut Vec<syn::Stmt>) {
             syn::Stmt::Expr(syn::Expr::Verbatim(v), Some(_)) if v.is_empty()
         )
     });
+}
+
+/// Read `let _ = e;` as `e;` when `e` is an unattributed call, method call or `.await` bound by
+/// an unattributed, unannotated wildcard. The value of `e` drops at the end of either statement,
+/// while a place initializer would move under the statement and not under the `let`.
+fn discard_call_bindings(stmts: &mut [syn::Stmt]) {
+    for stmt in stmts {
+        if let syn::Stmt::Local(local) = stmt
+            && local.attrs.is_empty()
+            && matches!(&local.pat, syn::Pat::Wild(wild) if wild.attrs.is_empty())
+            && let Some(init) = &mut local.init
+            && init.diverge.is_none()
+            && matches!(
+                init.expr.as_ref(),
+                syn::Expr::Call(_) | syn::Expr::MethodCall(_) | syn::Expr::Await(_)
+            )
+            && expr_attrs(&init.expr).is_empty()
+        {
+            let semi = local.semi_token;
+            let expr = core::mem::replace(
+                init.expr.as_mut(),
+                syn::Expr::Verbatim(proc_macro2::TokenStream::new()),
+            );
+            *stmt = syn::Stmt::Expr(expr, Some(semi));
+        }
+    }
 }
 
 /// Give every statement macro but the last one a semicolon, which the
@@ -1233,6 +1489,150 @@ fn elide(sig: &mut syn::Signature, name: &syn::Ident) {
     if sig.generics.params.is_empty() {
         sig.generics.lt_token = None;
         sig.generics.gt_token = None;
+    }
+}
+
+/// Write each lifetime parameter of an impl that the header names once, as a path argument or
+/// a reference lifetime outside function pointers, trait objects and `impl Trait`,
+/// and that no bound, `where` predicate or item names, as `'_` in that position and drop the
+/// parameter. Each `'_` of an impl header is a fresh parameter of its own.
+fn elide_impl_lifetimes(node: &mut syn::ItemImpl) {
+    use syn::visit::Visit;
+
+    let candidates: Vec<syn::Ident> = node
+        .generics
+        .params
+        .iter()
+        .filter_map(|param| match param {
+            syn::GenericParam::Lifetime(param)
+                if param.attrs.is_empty() && param.bounds.is_empty() =>
+            {
+                Some(param.lifetime.ident.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    for name in candidates {
+        let mut bounds = LifetimeUses {
+            name: &name,
+            count: 0,
+            opaque: false,
+        };
+        for param in &node.generics.params {
+            if !matches!(param, syn::GenericParam::Lifetime(param) if param.lifetime.ident == name)
+            {
+                bounds.visit_generic_param(param);
+            }
+        }
+        if let Some(clause) = &node.generics.where_clause {
+            bounds.visit_where_clause(clause);
+        }
+        let mut mentions = BodyMentions {
+            name: &name,
+            found: false,
+        };
+        for item in &node.items {
+            mentions.visit_impl_item(item);
+        }
+        let mut header = HeaderUses {
+            name: &name,
+            uses: 0,
+            other: false,
+            depth: 0,
+        };
+        if let Some((path, _)) = &node.trait_ {
+            header.visit_path(path);
+        }
+        header.visit_type(&node.self_ty);
+        if bounds.opaque || bounds.count != 0 || mentions.found || header.other || header.uses != 1
+        {
+            continue;
+        }
+        let mut anonymize = Anonymize(&name);
+        if let Some((path, _)) = &mut node.trait_ {
+            anonymize.visit_path_mut(path);
+        }
+        anonymize.visit_type_mut(&mut node.self_ty);
+        node.generics.params = core::mem::take(&mut node.generics.params)
+            .into_iter()
+            .filter(|param| {
+                !matches!(param, syn::GenericParam::Lifetime(param) if param.lifetime.ident == name)
+            })
+            .collect();
+        if node.generics.params.is_empty() {
+            node.generics.lt_token = None;
+            node.generics.gt_token = None;
+        }
+    }
+}
+
+/// Spells the lifetime `'name` as `'_`.
+struct Anonymize<'a>(&'a syn::Ident);
+
+impl VisitMut for Anonymize<'_> {
+    fn visit_lifetime_mut(&mut self, lifetime: &mut syn::Lifetime) {
+        if lifetime.ident == *self.0 {
+            lifetime.ident = syn::Ident::new("_", lifetime.ident.span());
+        }
+    }
+}
+
+/// The uses of one lifetime in an impl header: `uses` counts path arguments and reference
+/// lifetimes outside the constructs that give `'_` another meaning, and `other` records any
+/// other use or a macro the header holds.
+struct HeaderUses<'a> {
+    name: &'a syn::Ident,
+    uses: usize,
+    other: bool,
+    /// Enclosing function pointers, trait objects and `impl Trait`.
+    depth: usize,
+}
+
+impl HeaderUses<'_> {
+    fn count(&mut self, lifetime: &syn::Lifetime) {
+        if lifetime.ident == *self.name {
+            if self.depth == 0 {
+                self.uses += 1;
+            } else {
+                self.other = true;
+            }
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for HeaderUses<'_> {
+    fn visit_type_reference(&mut self, reference: &'ast syn::TypeReference) {
+        if let Some(lifetime) = &reference.lifetime {
+            self.count(lifetime);
+        }
+        self.visit_type(&reference.elem);
+    }
+
+    fn visit_generic_argument(&mut self, argument: &'ast syn::GenericArgument) {
+        match argument {
+            syn::GenericArgument::Lifetime(lifetime) => self.count(lifetime),
+            _ => syn::visit::visit_generic_argument(self, argument),
+        }
+    }
+
+    fn visit_lifetime(&mut self, lifetime: &'ast syn::Lifetime) {
+        self.other |= lifetime.ident == *self.name;
+    }
+
+    fn visit_type(&mut self, ty: &'ast syn::Type) {
+        match ty {
+            syn::Type::FnPtr(_) | syn::Type::TraitObject(_) | syn::Type::ImplTrait(_) => {
+                self.depth += 1;
+                syn::visit::visit_type(self, ty);
+                self.depth -= 1;
+            }
+            syn::Type::Macro(_) | syn::Type::Verbatim(_) => self.other = true,
+            _ => syn::visit::visit_type(self, ty),
+        }
+    }
+
+    fn visit_macro(&mut self, _: &'ast syn::Macro) {
+        self.other = true;
     }
 }
 
@@ -1582,20 +1982,11 @@ fn bounds_to_where(generics: &mut syn::Generics) {
 }
 
 /// Merge the `where` predicates of one bounded type into one and sort its bounds by text, the
-/// parameters of `generics` read by position so that renamed parameters sort alike. A predicate
-/// with a `for<…>` binder or an attribute stays apart, and bounds of the `Fn` family, with an
-/// associated item binding or opaque to the parser keep their order.
-fn sort_bounds(generics: &mut syn::Generics) {
+/// generic parameters in scope, `names`, read by position so that renamed parameters sort alike.
+/// A predicate with a `for<…>` binder or an attribute stays apart.
+fn sort_bounds(generics: &mut syn::Generics, names: &[(bool, String)]) {
     use quote::ToTokens as _;
 
-    let mut names: Vec<(bool, String)> = Vec::with_capacity(generics.params.len());
-    for param in &generics.params {
-        names.push(match param {
-            syn::GenericParam::Type(param) => (false, param.ident.to_string()),
-            syn::GenericParam::Const(param) => (false, param.ident.to_string()),
-            syn::GenericParam::Lifetime(param) => (true, param.lifetime.ident.to_string()),
-        });
-    }
     let Some(clause) = &mut generics.where_clause else {
         return;
     };
@@ -1628,17 +2019,28 @@ fn sort_bounds(generics: &mut syn::Generics) {
     for (key, predicate) in &mut merged {
         if key.is_some()
             && let syn::WherePredicate::Type(predicate) = predicate
-            && predicate.bounds.iter().all(sortable_bound)
         {
-            let mut bounds: Vec<syn::TypeParamBound> =
-                core::mem::take(&mut predicate.bounds).into_iter().collect();
-            bounds.sort_by_cached_key(|bound| bound_key(bound, &names));
-            predicate.bounds = bounds.into_iter().collect();
+            sort_bound_slice(&mut predicate.bounds, names);
         }
     }
     clause
         .predicates
         .extend(merged.into_iter().map(|(_, predicate)| predicate));
+}
+
+/// Sort a bound list by text, the generic parameters in scope, `names`, read by position. Bounds
+/// of the `Fn` family, with an associated item binding or opaque to the parser keep the whole
+/// list in its order.
+fn sort_bound_slice(
+    bounds: &mut syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    names: &[(bool, String)],
+) {
+    if bounds.len() < 2 || !bounds.iter().all(sortable_bound) {
+        return;
+    }
+    let mut sorted: Vec<syn::TypeParamBound> = core::mem::take(bounds).into_iter().collect();
+    sorted.sort_by_cached_key(|bound| bound_key(bound, names));
+    *bounds = sorted.into_iter().collect();
 }
 
 /// Whether a bound's place in its list is free: a lifetime, or a trait bound outside the `Fn`
@@ -1682,7 +2084,7 @@ fn bound_key(bound: &syn::TypeParamBound, names: &[(bool, String)]) -> String {
                     let text = ident.to_string();
                     match names
                         .iter()
-                        .position(|(is_lifetime, name)| *is_lifetime == lifetime && *name == text)
+                        .rposition(|(is_lifetime, name)| *is_lifetime == lifetime && *name == text)
                     {
                         Some(position) => {
                             out.push('#');
@@ -2429,10 +2831,12 @@ fn std_format_operand(path: &syn::Path, rebound: u64) -> Option<(usize, bool)> {
 }
 
 /// Move identifier arguments of a std formatting macro into its format string,
-/// `println!("{}", x)` becoming `println!("{x}")`, in `mac` and in every proven formatting
-/// call among its arguments, with `rebound` the std names the scopes around `mac` bind to
-/// something else. Any other macro keeps its tokens as written. Returns whether `mac` changed.
-fn inline_format_args(mac: &mut syn::Macro, rebound: u64) -> bool {
+/// `println!("{}", x)` becoming `println!("{x}")`, and with `literals` the unsuffixed string
+/// literal arguments of plain `{}` placeholders, braces doubled, in `mac` and in every proven
+/// formatting call among its arguments, with `rebound` the std names the scopes around `mac`
+/// bind to something else. Any other macro keeps its tokens as written. Returns whether `mac`
+/// changed.
+fn inline_format_args(mac: &mut syn::Macro, rebound: u64, literals: bool) -> bool {
     use syn::parse::Parser;
 
     let Some((at, panic)) = std_format_operand(&mac.path, rebound) else {
@@ -2444,12 +2848,13 @@ fn inline_format_args(mac: &mut syn::Macro, rebound: u64) -> bool {
     };
     let mut nested = NestedFormat {
         rebound,
+        literals,
         changed: false,
     };
     for arg in &mut args {
         nested.visit_expr_mut(arg);
     }
-    let inlined = !panic && inline_positional(at, &mut args);
+    let inlined = !panic && inline_positional(at, &mut args, literals);
     if nested.changed || inlined {
         mac.tokens = args.to_token_stream();
     }
@@ -2460,6 +2865,7 @@ fn inline_format_args(mac: &mut syn::Macro, rebound: u64) -> bool {
 /// enters.
 struct NestedFormat {
     rebound: u64,
+    literals: bool,
     changed: bool,
 }
 
@@ -2484,15 +2890,27 @@ impl VisitMut for NestedFormat {
     }
 
     fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
-        self.changed |= inline_format_args(mac, self.rebound);
+        self.changed |= inline_format_args(mac, self.rebound, self.literals);
     }
 }
 
-/// Inline the identifier arguments after the format string at `at` among `args`. Returns
-/// whether anything moved.
+/// A positional formatting argument a placeholder may spell inline.
+enum Inline {
+    /// An identifier the format string captures.
+    Name(String),
+    /// The value of a string literal a plain `{}` writes as it is.
+    Text(String),
+    /// Any other argument, which stays an argument.
+    Kept,
+}
+
+/// Inline the identifier arguments after the format string at `at` among `args`, and with
+/// `literals` the string literal arguments of plain placeholders. Returns whether anything
+/// moved.
 fn inline_positional(
     at: usize,
     args: &mut syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
+    literals: bool,
 ) -> bool {
     let positional: Vec<&syn::Expr> = args.iter().skip(at + 1).collect();
     if positional
@@ -2501,7 +2919,10 @@ fn inline_positional(
     {
         return false;
     }
-    let names: Vec<Option<String>> = positional.into_iter().map(capturable).collect();
+    let inlines: Vec<Inline> = positional
+        .into_iter()
+        .map(|arg| inline_argument(arg, literals))
+        .collect();
     let Some(syn::Expr::Lit(syn::ExprLit {
         lit: syn::Lit::Str(format),
         ..
@@ -2509,41 +2930,50 @@ fn inline_positional(
     else {
         return false;
     };
-    let Some(text) = inline_placeholders(&format.value(), &names) else {
+    let Some((text, moved)) = inline_placeholders(&format.value(), &inlines) else {
         return false;
     };
     *format = syn::LitStr::new(&text, format.span());
     let kept = core::mem::take(args)
         .into_iter()
         .enumerate()
-        .filter(|(index, _)| *index <= at || names[index - at - 1].is_none())
+        .filter(|(index, _)| *index <= at || !moved[index - at - 1])
         .map(|(_, arg)| arg);
     args.extend(kept);
     true
 }
 
-/// The identifier a format string captures for `arg`, `None` for any other
-/// expression and for the names a placeholder cannot spell.
-fn capturable(arg: &syn::Expr) -> Option<String> {
-    let syn::Expr::Path(path) = arg else {
-        return None;
-    };
-    if !path.attrs.is_empty() {
-        return None;
+/// What a placeholder may spell for `arg`: the identifier a format string captures, with
+/// `literals` the value of an unattributed, unsuffixed string literal, or nothing.
+fn inline_argument(arg: &syn::Expr, literals: bool) -> Inline {
+    match arg {
+        syn::Expr::Lit(syn::ExprLit {
+            attrs,
+            lit: syn::Lit::Str(literal),
+        }) if literals && attrs.is_empty() && literal.suffix().is_empty() => {
+            Inline::Text(literal.value())
+        }
+        syn::Expr::Path(path) if path.attrs.is_empty() => path
+            .path
+            .get_ident()
+            .map(ToString::to_string)
+            .filter(|name| {
+                !name.starts_with("r#")
+                    && !matches!(name.as_str(), "self" | "Self" | "crate" | "super")
+            })
+            .map_or(Inline::Kept, Inline::Name),
+        _ => Inline::Kept,
     }
-    let name = path.path.get_ident()?.to_string();
-    let spellable =
-        !name.starts_with("r#") && !matches!(name.as_str(), "self" | "Self" | "crate" | "super");
-    spellable.then_some(name)
 }
 
-/// `format` with each implicit `{}` or `{:spec}` placeholder whose argument
-/// in `names` is an identifier spelled inline. `None` when nothing moves, or
-/// when an explicit index, a `$` or `*` spec or a count mismatch makes the
-/// argument order matter.
-fn inline_placeholders(format: &str, names: &[Option<String>]) -> Option<String> {
+/// `format` with each implicit `{}` or `{:spec}` placeholder whose argument in `inlines` is an
+/// identifier spelled inline, and each plain `{}` whose argument is a literal replaced by the
+/// literal's text with its braces doubled, with the arguments that moved. `None` when nothing
+/// moves, or when an explicit index, a `$` or `*` spec or a count mismatch makes the argument
+/// order matter.
+fn inline_placeholders(format: &str, inlines: &[Inline]) -> Option<(String, Vec<bool>)> {
     let mut out = String::with_capacity(format.len());
-    let mut next = 0;
+    let mut moved = Vec::with_capacity(inlines.len());
     let mut chars = format.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -2567,10 +2997,22 @@ fn inline_placeholders(format: &str, names: &[Option<String>]) -> Option<String>
                 if explicit_index || spec.is_some_and(|spec| spec.contains(['$', '*'])) {
                     return None;
                 }
+                if arg.is_empty()
+                    && spec.is_none()
+                    && let Inline::Text(text) = inlines.get(moved.len())?
+                {
+                    out.push_str(&text.replace('{', "{{").replace('}', "}}"));
+                    moved.push(true);
+                    continue;
+                }
                 out.push('{');
                 if arg.is_empty() {
-                    out.push_str(names.get(next)?.as_deref().unwrap_or_default());
-                    next += 1;
+                    let name = match inlines.get(moved.len())? {
+                        Inline::Name(name) => Some(name.as_str()),
+                        _ => None,
+                    };
+                    out.push_str(name.unwrap_or_default());
+                    moved.push(name.is_some());
                 } else {
                     out.push_str(arg);
                 }
@@ -2584,5 +3026,5 @@ fn inline_placeholders(format: &str, names: &[Option<String>]) -> Option<String>
             c => out.push(c),
         }
     }
-    (next == names.len() && names.iter().any(Option::is_some)).then_some(out)
+    (moved.len() == inlines.len() && moved.contains(&true)).then_some((out, moved))
 }

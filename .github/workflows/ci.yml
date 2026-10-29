@@ -28,7 +28,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
@@ -37,6 +37,23 @@ jobs:
       - run: cargo clippy --workspace --lib --no-default-features --locked -- -D warnings
       - run: cargo clippy -p echoes --all-targets --no-default-features --features std --locked -- -D warnings
       - run: cargo doc --workspace --no-deps --locked
+
+  msrv:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The toolchain matches `rust-version` in both manifests.
+      - run: cargo check -p syn-canon -p echoes --locked
+      - run: cargo check -p syn-canon --no-default-features --locked
+      - run: cargo check -p echoes --no-default-features --features std --locked
 
   test:
     name: test (${{ matrix.name }})
@@ -58,10 +75,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-nextest
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.name }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -396,3 +413,146 @@ jobs:
         with:
           name: constructor-returns-witnesses
           path: ${{ runner.temp }}/constructor-returns-witnesses.json
+      - name: Verify guard clause witnesses
+        id: guard_clauses_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/guard_clauses_cases.json
+          --request-id "DG-CI-GUARDS-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/guard-clauses-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.guard_clauses_witnesses.outcome != 'skipped'
+        with:
+          name: guard-clauses-witnesses
+          path: ${{ runner.temp }}/guard-clauses-witnesses.json
+      - name: Verify match arm witnesses
+        id: match_arms_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/match_arms_cases.json
+          --request-id "DG-CI-ARMS-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/match-arms-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.match_arms_witnesses.outcome != 'skipped'
+        with:
+          name: match-arms-witnesses
+          path: ${{ runner.temp }}/match-arms-witnesses.json
+      - name: Verify discarded call witnesses
+        id: discarded_calls_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/discarded_calls_cases.json
+          --request-id "DG-CI-DISCARD-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/discarded-calls-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.discarded_calls_witnesses.outcome != 'skipped'
+        with:
+          name: discarded-calls-witnesses
+          path: ${{ runner.temp }}/discarded-calls-witnesses.json
+      - name: Verify adjacent comparison witnesses
+        id: adjacent_comparisons_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/adjacent_comparisons_cases.json
+          --request-id "DG-CI-ADJACENT-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/adjacent-comparisons-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.adjacent_comparisons_witnesses.outcome != 'skipped'
+        with:
+          name: adjacent-comparisons-witnesses
+          path: ${{ runner.temp }}/adjacent-comparisons-witnesses.json
+      - name: Verify integer choice witnesses
+        id: bool_int_min_max_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/bool_int_min_max_cases.json
+          --request-id "DG-CI-CHOICE-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/bool-int-min-max-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.bool_int_min_max_witnesses.outcome != 'skipped'
+        with:
+          name: bool-int-min-max-witnesses
+          path: ${{ runner.temp }}/bool-int-min-max-witnesses.json
+      - name: Verify collection iteration witnesses
+        id: collection_iteration_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/collection_iteration_cases.json
+          --request-id "DG-CI-ITER-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/collection-iteration-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.collection_iteration_witnesses.outcome != 'skipped'
+        with:
+          name: collection-iteration-witnesses
+          path: ${{ runner.temp }}/collection-iteration-witnesses.json
+      - name: Verify string and formatting witnesses
+        id: strings_format_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/strings_format_cases.json
+          --request-id "DG-CI-STRINGS-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/strings-format-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.strings_format_witnesses.outcome != 'skipped'
+        with:
+          name: strings-format-witnesses
+          path: ${{ runner.temp }}/strings-format-witnesses.json
+      - name: Verify bound order and impl lifetime witnesses
+        id: bounds_impl_lifetimes_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/bounds_impl_lifetimes_cases.json
+          --request-id "DG-CI-BOUNDS-IMPL-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/bounds-impl-lifetimes-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.bounds_impl_lifetimes_witnesses.outcome != 'skipped'
+        with:
+          name: bounds-impl-lifetimes-witnesses
+          path: ${{ runner.temp }}/bounds-impl-lifetimes-witnesses.json
+      - name: Verify literal cast, limit and power-of-two witnesses
+        id: literal_casts_limits_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/literal_casts_limits_cases.json
+          --request-id "DG-CI-CASTS-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/literal-casts-limits-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.literal_casts_limits_witnesses.outcome != 'skipped'
+        with:
+          name: literal-casts-limits-witnesses
+          path: ${{ runner.temp }}/literal-casts-limits-witnesses.json
+      - name: Verify literal disjunction witnesses
+        id: literal_disjunctions_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/literal_disjunctions_cases.json
+          --request-id "DG-CI-DISJ-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/literal-disjunctions-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.literal_disjunctions_witnesses.outcome != 'skipped'
+        with:
+          name: literal-disjunctions-witnesses
+          path: ${{ runner.temp }}/literal-disjunctions-witnesses.json
+      - name: Verify return literal typing witnesses
+        id: return_literal_typing_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/return_literal_typing_cases.json
+          --request-id "DG-CI-RETURNS-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/return-literal-typing-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.return_literal_typing_witnesses.outcome != 'skipped'
+        with:
+          name: return-literal-typing-witnesses
+          path: ${{ runner.temp }}/return-literal-typing-witnesses.json

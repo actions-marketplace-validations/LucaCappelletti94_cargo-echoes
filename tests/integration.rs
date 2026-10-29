@@ -692,7 +692,7 @@ fn function_groups(report: &Report) -> Vec<Vec<&str>> {
 fn xor_doctests_group_only_the_proven_primitive_cancellations() {
     let report = Echoes::default().run(XOR_FIXTURE).unwrap();
     assert_eq!(report.total, 16);
-    assert_eq!(report.unique, 11);
+    assert_eq!(report.unique, 10);
     let mut groups: Vec<Vec<&str>> = report
         .groups
         .iter()
@@ -715,7 +715,7 @@ fn xor_doctests_group_only_the_proven_primitive_cancellations() {
                 "xorws::OddWritten",
                 "xorws::Plain"
             ],
-            vec!["xorws::Written", "xorws::Zero"],
+            vec!["xorws::PartialZero", "xorws::Written", "xorws::Zero"],
         ]
     );
 }
@@ -1573,6 +1573,395 @@ fn constructor_return_functions_group_with_their_tails() {
         assert_eq!(function_groups(&scan(tokens)), expected);
     }
     assert_eq!(function_groups(&scan(7)).len(), 0);
+}
+
+const GUARD_FIXTURE: &str = "tests/fixtures/guardws";
+
+#[test]
+fn guard_clause_doctests_group_with_their_conditionals() {
+    let report = Echoes::default().run(GUARD_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["guardws::Guarded", "guardws::Nested"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default().min_tokens(22).run(GUARD_FIXTURE).unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default().min_tokens(23).run(GUARD_FIXTURE).unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn breaking_loop_functions_group_with_their_while_loops() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(GUARD_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["guardws::drain", "guardws::wait"]];
+    for tokens in [0, 13] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(14)).len(), 0);
+}
+
+const ARMS_FIXTURE: &str = "tests/fixtures/armsws";
+
+#[test]
+fn if_let_doctests_group_with_their_matches() {
+    let report = Echoes::default().run(ARMS_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["armsws::IfLet", "armsws::Matched"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default().min_tokens(25).run(ARMS_FIXTURE).unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default().min_tokens(26).run(ARMS_FIXTURE).unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn reordered_variant_arms_group_their_functions() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(ARMS_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["armsws::pause", "armsws::wait"]];
+    for tokens in [0, 11] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(12)).len(), 0);
+}
+
+const DISCARD_FIXTURE: &str = "tests/fixtures/discardws";
+
+#[test]
+fn discarded_call_doctests_group_with_their_statements() {
+    let report = Echoes::default().run(DISCARD_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["discardws::Bound", "discardws::Dropped"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(21)
+        .run(DISCARD_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(22)
+        .run(DISCARD_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn discarded_call_functions_group_with_their_statements() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(DISCARD_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["discardws::shorten", "discardws::trim"]];
+    for tokens in [0, 8] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(9)).len(), 0);
+}
+
+const BOUNDS_FIXTURE: &str = "tests/fixtures/boundsws";
+
+#[test]
+fn inclusive_bound_doctests_group_with_their_strict_bounds() {
+    let report = Echoes::default().run(BOUNDS_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["boundsws::Inclusive", "boundsws::Strict"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(23)
+        .run(BOUNDS_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(24)
+        .run(BOUNDS_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn inclusive_bound_functions_group_with_their_strict_bounds() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(BOUNDS_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["boundsws::adult", "boundsws::grown"]];
+    for tokens in [0, 3] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(4)).len(), 0);
+}
+
+const CHOICE_FIXTURE: &str = "tests/fixtures/choicews";
+
+#[test]
+fn integer_choice_doctests_group_with_their_casts_and_maxima() {
+    let report = Echoes::default().run(CHOICE_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["choicews::Branched", "choicews::Folded"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(33)
+        .run(CHOICE_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(34)
+        .run(CHOICE_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn conditional_maximum_functions_group_with_std_max() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(CHOICE_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["choicews::ceiling", "choicews::larger"]];
+    for tokens in [0, 4] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(5)).len(), 0);
+}
+
+const ITER_FIXTURE: &str = "tests/fixtures/iterws";
+
+#[test]
+fn iterated_doctests_group_with_their_borrowed_loops() {
+    let report = Echoes::default().run(ITER_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["iterws::Borrowed", "iterws::Iterated"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default().min_tokens(26).run(ITER_FIXTURE).unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default().min_tokens(27).run(ITER_FIXTURE).unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn length_test_functions_group_with_their_emptiness_tests() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(ITER_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["iterws::blank", "iterws::unset"]];
+    for tokens in [0, 7] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(8)).len(), 0);
+}
+
+const STRINGS_FIXTURE: &str = "tests/fixtures/stringsws";
+
+#[test]
+fn literal_format_argument_doctests_group_with_their_inlined_strings() {
+    let report = Echoes::default().run(STRINGS_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["stringsws::Arguments", "stringsws::Inlined"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(18)
+        .run(STRINGS_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(19)
+        .run(STRINGS_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn empty_string_functions_group_with_string_new() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(STRINGS_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["stringsws::clear", "stringsws::reset"]];
+    for tokens in [0, 1] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(2)).len(), 0);
+}
+
+const BOUNDS_IMPL_FIXTURE: &str = "tests/fixtures/boundsimplws";
+
+#[test]
+fn impl_lifetime_and_bound_order_doctests_group_apart_from_a_tied_lifetime() {
+    let report = Echoes::default().run(BOUNDS_IMPL_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["boundsimplws::Anonymous", "boundsimplws::Named"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(51)
+        .run(BOUNDS_IMPL_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(52)
+        .run(BOUNDS_IMPL_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn reordered_impl_trait_argument_functions_group() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(BOUNDS_IMPL_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["boundsimplws::ordered", "boundsimplws::reversed"]];
+    for tokens in [0, 6] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(7)).len(), 0);
+}
+
+const CAST_LIMIT_FIXTURE: &str = "tests/fixtures/castlimitws";
+
+#[test]
+fn power_of_two_and_limit_doctests_group_with_their_shifts() {
+    let report = Echoes::default().run(CAST_LIMIT_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["castlimitws::Divided", "castlimitws::Shifted"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(35)
+        .run(CAST_LIMIT_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(36)
+        .run(CAST_LIMIT_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn signed_parity_functions_group_with_their_low_bit_test() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(CAST_LIMIT_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["castlimitws::is_even", "castlimitws::low_bit_clear"]];
+    for tokens in [0, 5] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(6)).len(), 0);
+}
+
+const DISJUNCTIONS_FIXTURE: &str = "tests/fixtures/disjunctionsws";
+
+#[test]
+fn matched_and_contained_doctests_group_with_their_chains() {
+    let report = Echoes::default().run(DISJUNCTIONS_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["disjunctionsws::Chained", "disjunctionsws::Matched"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(48)
+        .run(DISJUNCTIONS_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(49)
+        .run(DISJUNCTIONS_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn literal_chain_functions_group_with_matches() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(DISJUNCTIONS_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["disjunctionsws::rest", "disjunctionsws::weekend"]];
+    for tokens in [0, 7] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(8)).len(), 0);
+}
+
+const RETYPE_FIXTURE: &str = "tests/fixtures/retypews";
+
+#[test]
+fn unsuffixed_return_doctests_group_with_their_suffixed_form() {
+    let report = Echoes::default().run(RETYPE_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["retypews::Suffixed", "retypews::Unsuffixed"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(22)
+        .run(RETYPE_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(23)
+        .run(RETYPE_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn literal_tail_functions_group_by_their_return_type() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(RETYPE_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["retypews::hour", "retypews::limit"]];
+    for tokens in [0, 1] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(2)).len(), 0);
 }
 
 const CONTEXT_FIXTURE: &str = "tests/fixtures/contextws";

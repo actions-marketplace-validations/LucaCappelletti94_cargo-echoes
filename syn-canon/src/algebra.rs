@@ -227,6 +227,10 @@ impl Walker<'_, '_> {
         {
             return self.labeled_binary(binary, left, right);
         }
+        if self.dedup && matches!(binary.op, syn::BinOp::Eq(_) | syn::BinOp::Ne(_)) {
+            self.parity(&mut binary.left, &binary.right, total_calls);
+            self.parity(&mut binary.right, &binary.left, total_calls);
+        }
         let left = self.scalar_in_place(&mut binary.left, total_calls);
         let right = self.scalar_in_place(&mut binary.right, total_calls);
         let (Some(left), Some(right)) = (left, right) else {
@@ -253,6 +257,28 @@ impl Walker<'_, '_> {
             return (syn::Expr::Assign(assign), None);
         }
         self.labeled_binary(binary, left, right)
+    }
+
+    /// Spell `x % 2` as `x & 1` when `x` is a proven fixed-width integer and `other`, the
+    /// operand it compares with, is the literal zero. Either remainder sign meets zero alike.
+    fn parity(&self, side: &mut syn::Expr, other: &syn::Expr, total_calls: bool) {
+        let syn::Expr::Binary(remainder) = side else {
+            return;
+        };
+        if literal_value(other) != Some(0)
+            || !remainder.attrs.is_empty()
+            || !matches!(remainder.op, syn::BinOp::Rem(_))
+            || literal_value(&remainder.right) != Some(2)
+        {
+            return;
+        }
+        if let Some(PrimTy::Int { .. }) = self
+            .scalar_in_place(&mut remainder.left, total_calls)
+            .and_then(|label| label.prim())
+        {
+            remainder.op = syn::BinOp::BitAnd(syn::token::And::default());
+            *remainder.right = unsuffixed(1, remainder.right.span());
+        }
     }
 
     /// The labels of the referents of `&a == &b` or `&a != &b`, both proven primitives, with
@@ -337,23 +363,33 @@ impl Walker<'_, '_> {
             };
             return (expr, Some(schedule::identity_label(identity, left, right)));
         }
+        if self.dedup
+            && let Some((op, value)) = schedule::power_of_two(binary.op, &left, &right)
+        {
+            binary.op = op;
+            *binary.right = unsuffixed(value, binary.right.span());
+            return self.labeled_binary(binary, left, Lbl::Int(value, None));
+        }
         match schedule::total_binary(binary.op, &left, &right) {
             Some(TotalBinary::Flat(op, prim)) => {
                 let (expr, label) = self.flat(binary, op, prim, left, right);
                 (expr, Some(label))
             }
             Some(TotalBinary::Ordered { tag, reverse, prim }) => {
-                let (left, right) = if let Some(reverse) = reverse {
-                    core::mem::swap(&mut binary.left, &mut binary.right);
-                    binary.op = reverse.bin_op();
-                    (right, left)
+                if matches!(tag, '«' | '»') {
+                    return (
+                        syn::Expr::Binary(binary),
+                        Some(Lbl::Op(tag, Box::new(left), Box::new(right), prim)),
+                    );
+                }
+                let (lo, hi) = if reverse {
+                    (right.clone(), left.clone())
                 } else {
-                    (left, right)
+                    (left.clone(), right.clone())
                 };
-                (
-                    syn::Expr::Binary(binary),
-                    Some(Lbl::Op(tag, Box::new(left), Box::new(right), prim)),
-                )
+                let (tag, lo, hi) = schedule::adjacent(tag, lo, hi);
+                let expr = comparison_tokens(binary, [&left, &right], tag, [&lo, &hi]);
+                (expr, Some(Lbl::Op(tag, Box::new(lo), Box::new(hi), prim)))
             }
             None => {
                 if schedule::commutative_operands(binary.op, &left, &right) && right < left {
@@ -364,13 +400,35 @@ impl Walker<'_, '_> {
         }
     }
 
+    /// The comparison chain a `matches!` call or a range `contains` call tests, when the pass
+    /// may rewrite proven values.
+    fn disjunction(&self, expr: &syn::Expr) -> Option<syn::Expr> {
+        if !self.dedup || !matches!(expr, syn::Expr::Macro(_) | syn::Expr::MethodCall(_)) {
+            return None;
+        }
+        crate::disjunctions::expansion(self.renamer, &self.env, expr)
+    }
+
     fn scalar(&self, expr: syn::Expr, total_calls: bool) -> (syn::Expr, Option<Lbl>) {
         if !crate::drift::expr_attrs(&expr).is_empty() {
             return (expr, None);
         }
+        if let Some(chain) = self.disjunction(&expr) {
+            return self.scalar(chain, total_calls);
+        }
         match expr {
             syn::Expr::Binary(binary) => self.binary(binary, total_calls),
             syn::Expr::Unary(mut unary) if self.dedup && matches!(unary.op, syn::UnOp::Not(_)) => {
+                if schedule::double_not(&unary).is_some()
+                    && let syn::Expr::Unary(negated) = unary.expr.as_mut()
+                    && let Some(label) = self.scalar_in_place(&mut negated.expr, total_calls)
+                    && matches!(label.prim(), Some(PrimTy::Int { .. }))
+                {
+                    return (
+                        core::mem::replace(&mut *negated.expr, empty_expr()),
+                        Some(label),
+                    );
+                }
                 if let Some(inner) = self.scalar_in_place(&mut unary.expr, total_calls)
                     && inner.prim() == Some(PrimTy::Bool)
                 {
@@ -424,10 +482,18 @@ impl Walker<'_, '_> {
                 self.commutative(method)
             }
             syn::Expr::MethodCall(mut method)
-                if self.dedup && schedule::clone_call(&method) && self.renamer.clone_free() =>
+                if self.dedup
+                    && (schedule::clone_call(&method) && self.renamer.clone_free()
+                        || schedule::unit_power(&method)) =>
             {
+                let power = schedule::unit_power(&method);
                 match self.scalar_in_place(&mut method.receiver, total_calls) {
-                    Some(label) if label.prim().is_some() => (*method.receiver, Some(label)),
+                    Some(label)
+                        if !power && label.prim().is_some()
+                            || matches!(label.prim(), Some(PrimTy::Int { .. })) =>
+                    {
+                        (*method.receiver, Some(label))
+                    }
                     _ => (syn::Expr::MethodCall(method), None),
                 }
             }
@@ -450,6 +516,34 @@ impl Walker<'_, '_> {
     /// A call, read as a cast when it is the standard `T::from` of a proven primitive into a
     /// proven primitive `T` it converts to without loss, and as its operand when the types agree.
     fn call(&self, mut call: syn::ExprCall, total_calls: bool) -> (syn::Expr, Option<Lbl>) {
+        if let syn::Expr::Path(path) = call.func.as_ref()
+            && path.attrs.is_empty()
+            && path.qself.is_none()
+            && call.args.len() == 2
+            && let Some(tag) = self.renamer.standard_cmp(&path.path)
+        {
+            let left = self.scalar_in_place(&mut call.args[0], true);
+            let right = self.scalar_in_place(&mut call.args[1], true);
+            let (Some(left), Some(right)) = (left, right) else {
+                return (syn::Expr::Call(call), None);
+            };
+            let Some(prim) = schedule::commutative_prim(tag, &left, &right) else {
+                return (syn::Expr::Call(call), None);
+            };
+            let mut args: Vec<syn::Expr> = call.args.into_iter().collect();
+            let second = args.pop().expect("two arguments");
+            let first = args.pop().expect("two arguments");
+            let (receiver, argument) = if right < left && right.prim().is_some() {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            let name = if tag == '⊤' { "max" } else { "min" };
+            return (
+                method_call(receiver, name, argument),
+                Some(schedule::commutative_label(tag, prim, left, right)),
+            );
+        }
         let Some((name, target)) = schedule::from_conversion(self.renamer, &call) else {
             return if total_calls {
                 self.total_call(syn::Expr::Call(call))
@@ -667,6 +761,20 @@ impl Walker<'_, '_> {
         let (Some(then), Some(otherwise)) = (then, otherwise) else {
             return (syn::Expr::If(branch), None);
         };
+        if let Some(value) = schedule::integer_choice(self.renamer, &cond_label, &then, &otherwise)
+        {
+            let then_expr = core::mem::replace(
+                tail_expr_mut(&mut branch.then_branch).expect("proven scalar tail"),
+                empty_expr(),
+            );
+            let else_expr = core::mem::replace(
+                tail_expr_mut(&mut else_block.block).expect("proven scalar tail"),
+                empty_expr(),
+            );
+            let cond = (*branch.cond, cond_label);
+            let expr = choice_expr(&value, cond, (then_expr, &then), (else_expr, &otherwise));
+            return (expr, Some(value));
+        }
         let Some(value) = schedule::branch_value(&cond_label, &then, &otherwise) else {
             return (syn::Expr::If(branch), None);
         };
@@ -711,7 +819,7 @@ impl Walker<'_, '_> {
     /// Whether `method` is a commutative inherent method on a proven fixed-width integer
     /// receiver, which inherent resolution binds to the native by-value method.
     fn native_commutative(&self, method: &syn::ExprMethodCall) -> bool {
-        if schedule::commutative_method(method).is_none() {
+        if schedule::commutative_method(self.renamer, method).is_none() {
             return false;
         }
         let mut locals = 0;
@@ -730,7 +838,8 @@ impl Walker<'_, '_> {
     /// literal whose type the receiver infers staying the argument, or the other operand when
     /// one operand is the method's identity.
     fn commutative(&self, mut method: syn::ExprMethodCall) -> (syn::Expr, Option<Lbl>) {
-        let tag = schedule::commutative_method(&method).expect("a native commutative method");
+        let tag = schedule::commutative_method(self.renamer, &method)
+            .expect("a native commutative method");
         let receiver = self.scalar_in_place(&mut method.receiver, true);
         let argument = self.scalar_in_place(&mut method.args[0], true);
         let (Some(receiver), Some(argument)) = (receiver, argument) else {
@@ -809,6 +918,10 @@ impl VisitMut for Walker<'_, '_> {
         if !crate::drift::expr_attrs(expr).is_empty() {
             return;
         }
+        if let Some(chain) = self.disjunction(expr) {
+            *expr = self.scalar(chain, false).0;
+            return;
+        }
         match expr {
             syn::Expr::Match(r#match) if self.dedup && self.boolean_match(r#match) => {
                 let owned = core::mem::replace(expr, empty_expr());
@@ -825,7 +938,9 @@ impl VisitMut for Walker<'_, '_> {
                 *expr = self.scalar(owned, false).0;
             }
             syn::Expr::Call(call)
-                if self.dedup && schedule::from_conversion(self.renamer, call).is_some() =>
+                if self.dedup
+                    && (schedule::from_conversion(self.renamer, call).is_some()
+                        || matches!(call.func.as_ref(), syn::Expr::Path(path) if self.renamer.standard_cmp(&path.path).is_some())) =>
             {
                 let owned = core::mem::replace(expr, empty_expr());
                 *expr = self.scalar(owned, false).0;
@@ -842,7 +957,9 @@ impl VisitMut for Walker<'_, '_> {
             }
             syn::Expr::MethodCall(method)
                 if self.native_commutative(method)
-                    || self.dedup && schedule::clone_call(method) && self.renamer.clone_free() =>
+                    || self.dedup
+                        && (schedule::clone_call(method) && self.renamer.clone_free()
+                            || schedule::unit_power(method)) =>
             {
                 let owned = core::mem::replace(expr, empty_expr());
                 *expr = self.scalar(owned, false).0;
@@ -938,6 +1055,94 @@ fn logical(
         });
     (expr, label)
 }
+/// The spelling of an integer choice `value`: the `Ord` method over the two branch values in
+/// label order, or the cast of the condition, negated when `then` holds the `0`.
+fn choice_expr(
+    value: &Lbl,
+    cond: (syn::Expr, Lbl),
+    then: (syn::Expr, &Lbl),
+    otherwise: (syn::Expr, &Lbl),
+) -> syn::Expr {
+    if let Lbl::Flat(tag, ..) = value {
+        let (receiver, argument) = if otherwise.1 < then.1 && otherwise.1.prim().is_some() {
+            (otherwise.0, then.0)
+        } else {
+            (then.0, otherwise.0)
+        };
+        return method_call(receiver, if *tag == '⊤' { "max" } else { "min" }, argument);
+    }
+    let (operand, _) = if then.1.literal_bits() == Some(1) {
+        cond
+    } else {
+        negate(cond.0, cond.1)
+    };
+    let name = then
+        .1
+        .prim()
+        .and_then(schedule::int_type_ident)
+        .expect("an integer choice of a fixed-width type");
+    syn::Expr::Cast(syn::ExprCast {
+        attrs: Vec::new(),
+        expr: Box::new(operand),
+        as_token: syn::token::As::default(),
+        ty: Box::new(syn::Type::Path(syn::TypePath {
+            attrs: Vec::new(),
+            qself: None,
+            path: syn::Path::from(name),
+        })),
+    })
+}
+
+/// The method call `receiver.name(argument)`.
+fn method_call(receiver: syn::Expr, name: &str, argument: syn::Expr) -> syn::Expr {
+    syn::Expr::MethodCall(syn::ExprMethodCall {
+        attrs: Vec::new(),
+        receiver: Box::new(receiver),
+        dot_token: syn::token::Dot::default(),
+        method: syn::Ident::new(name, proc_macro2::Span::call_site()),
+        turbofish: None,
+        paren_token: syn::token::Paren::default(),
+        args: core::iter::once(argument).collect(),
+    })
+}
+
+/// The tokens of `lo tag hi` over the operands of `binary`, labeled `operands`. An integer
+/// literal takes the spelling of its label, and every other operand moves to the place its label
+/// holds in `target`.
+fn comparison_tokens(
+    mut binary: syn::ExprBinary,
+    operands: [&Lbl; 2],
+    tag: char,
+    target: [&Lbl; 2],
+) -> syn::Expr {
+    let span = binary.span();
+    let mut exprs = [
+        Some(core::mem::replace(&mut *binary.left, empty_expr())),
+        Some(core::mem::replace(&mut *binary.right, empty_expr())),
+    ];
+    let mut place = |label: &Lbl| match label {
+        Lbl::Int(bits, Some(prim)) => crate::constants::literal_expr(*prim, *bits, span),
+        Lbl::Int(bits, None) => syn::Expr::Lit(syn::ExprLit {
+            attrs: Vec::new(),
+            lit: syn::Lit::Int(syn::LitInt::new(&bits.to_string(), span)),
+        }),
+        _ => {
+            let index = (0..2)
+                .find(|&index| exprs[index].is_some() && operands[index] == label)
+                .expect("a comparison operand keeps its label");
+            exprs[index].take().expect("an operand placed once")
+        }
+    };
+    *binary.left = place(target[0]);
+    *binary.right = place(target[1]);
+    binary.op = match tag {
+        '<' => syn::BinOp::Lt(syn::token::Lt::default()),
+        '≤' => syn::BinOp::Le(syn::token::Le::default()),
+        '=' => syn::BinOp::Eq(syn::token::EqEq::default()),
+        _ => syn::BinOp::Ne(syn::token::Ne::default()),
+    };
+    syn::Expr::Binary(binary)
+}
 
 fn negate(expr: syn::Expr, label: Lbl) -> (syn::Expr, Lbl) {
     let span = expr.span();
@@ -948,18 +1153,10 @@ fn negate(expr: syn::Expr, label: Lbl) -> (syn::Expr, Lbl) {
             let right = negate(*binary.right, *right);
             logical(schedule::dual(tag), left, right, false)
         }
-        (syn::Expr::Binary(mut binary), label @ Lbl::Op('<' | '≤' | '=' | '!', ..)) => {
-            let complement = schedule::not_label(label);
-            binary.op = match &complement {
-                Lbl::Op('<', ..) => syn::BinOp::Lt(syn::token::Lt::default()),
-                Lbl::Op('≤', ..) => syn::BinOp::Le(syn::token::Le::default()),
-                Lbl::Op('=', ..) => syn::BinOp::Eq(syn::token::EqEq::default()),
-                _ => syn::BinOp::Ne(syn::token::Ne::default()),
-            };
-            if matches!(complement, Lbl::Op('<' | '≤', ..)) {
-                core::mem::swap(&mut binary.left, &mut binary.right);
-            }
-            (syn::Expr::Binary(binary), complement)
+        (syn::Expr::Binary(binary), Lbl::Op(tag @ ('<' | '≤' | '=' | '!'), left, right, prim)) => {
+            let (tag, lo, hi) = schedule::complement(tag, (*left).clone(), (*right).clone());
+            let expr = comparison_tokens(binary, [&left, &right], tag, [&lo, &hi]);
+            (expr, Lbl::Op(tag, Box::new(lo), Box::new(hi), prim))
         }
         (_, Lbl::Bool(value)) => (
             syn::Expr::Lit(syn::ExprLit {
@@ -1062,4 +1259,23 @@ fn emit(
         op,
         right: Box::new(right),
     })
+}
+
+/// The unsuffixed integer literal `value`.
+fn unsuffixed(value: u128, span: proc_macro2::Span) -> syn::Expr {
+    syn::Expr::Lit(syn::ExprLit {
+        attrs: Vec::new(),
+        lit: syn::Lit::Int(syn::LitInt::new(&value.to_string(), span)),
+    })
+}
+
+/// The value of an unattributed integer literal.
+fn literal_value(expr: &syn::Expr) -> Option<u128> {
+    match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            attrs,
+            lit: syn::Lit::Int(literal),
+        }) if attrs.is_empty() => literal.base10_parse().ok(),
+        _ => None,
+    }
 }

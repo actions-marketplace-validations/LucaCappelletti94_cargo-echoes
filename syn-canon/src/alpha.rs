@@ -54,6 +54,9 @@ pub(crate) struct Options<'a> {
     /// Every import in view comes from the standard library and no trait in view declares a
     /// `clone` method.
     pub(crate) clone_free: bool,
+    /// Every import in view comes from the standard library and no trait in view declares a
+    /// method named `iter`, `iter_mut`, `into_iter`, `len` or `is_empty`.
+    pub(crate) collection_free: bool,
     /// The source context's helper summary table, when one is indexed.
     pub(crate) helper_table: Option<&'a crate::helpers::HelperTable>,
     pub(crate) helper_module: &'a [String],
@@ -339,6 +342,9 @@ pub(crate) struct Renamer<'env> {
     /// Every import in view comes from the standard library and no trait in view declares a
     /// `clone` method.
     clone_free: bool,
+    /// Every import in view comes from the standard library and no trait in view declares a
+    /// collection method the iteration and emptiness readings rely on.
+    collection_free: bool,
     /// An enclosing block of the current item already read its owned strings and empty vectors.
     prelude_folded: bool,
     /// The inline modules around the traversal, whose frames stay on the stack.
@@ -367,6 +373,8 @@ pub(crate) struct Renamer<'env> {
     /// Original-syntax resolution without rewriting.
     analysis: bool,
     receiver: bool,
+    /// The body of the function being visited and its declared fixed-width integer return type.
+    body_return: Option<(*const syn::Block, PrimTy)>,
 }
 
 impl<'env> Renamer<'env> {
@@ -400,6 +408,7 @@ impl<'env> Renamer<'env> {
             prelude: false,
             owned_methods: false,
             clone_free: false,
+            collection_free: false,
             prelude_folded: false,
             inline_depth: 0,
             observed: false,
@@ -419,6 +428,7 @@ impl<'env> Renamer<'env> {
             helper_blocked: false,
             analysis: false,
             receiver: false,
+            body_return: None,
         }
     }
 
@@ -456,6 +466,7 @@ impl<'env> Renamer<'env> {
         renamer.prelude = options.prelude;
         renamer.owned_methods = options.owned_methods;
         renamer.clone_free = options.clone_free;
+        renamer.collection_free = options.collection_free;
         renamer.observed = options.observed;
         renamer.tail_blocked = options.enclosing_observed;
         renamer.seed = options.seed;
@@ -1249,11 +1260,38 @@ impl<'env> Renamer<'env> {
         self.owned_methods
     }
 
+    /// The declared fixed-width integer return type of the function whose body is `block`.
+    pub(crate) fn body_return(&self, block: &syn::Block) -> Option<PrimTy> {
+        self.body_return
+            .filter(|(body, _)| core::ptr::eq(*body, block))
+            .map(|(_, prim)| prim)
+    }
+
     /// Whether `clone` on a primitive resolves to `Clone::clone`: the standard prelude is
     /// active, every import in view comes from the standard library and no trait in view
     /// declares a `clone` method.
     pub(crate) fn clone_free(&self) -> bool {
         self.prelude && self.clone_free
+    }
+
+    /// Whether the standard collection methods `iter`, `iter_mut`, `into_iter`, `len` and
+    /// `is_empty`, and the inherent `contains` of the standard ranges, answer their calls: the
+    /// standard prelude is active, every import in view comes from the standard library and no
+    /// trait in view declares one of those names.
+    pub(crate) fn collection_free(&self) -> bool {
+        self.prelude && self.collection_free
+    }
+
+    /// Whether the collection readings may run: compiling source with the standard collection
+    /// methods in view, outside observed code and macro-reached scopes.
+    fn collections_allowed(&self) -> bool {
+        (self.compiles || self.analysis)
+            && self.collection_free()
+            && !self.observed
+            && !self.tail_blocked
+            && self.macro_origins.is_none()
+            && !self.glob_uncertain()
+            && !self.scopes.iter().any(|scope| scope.frozen)
     }
 
     /// Whether `path` names the standard `vec!` macro.
@@ -1262,6 +1300,16 @@ impl<'env> Renamer<'env> {
             self.standard_name(path, false),
             Some(crate::macros::MacroResolution::Macro(
                 crate::macros::MacroGrammar::Vector
+            ))
+        )
+    }
+
+    /// Whether `path` names the standard `matches!` macro.
+    pub(crate) fn standard_matches(&self, path: &syn::Path) -> bool {
+        matches!(
+            self.standard_name(path, false),
+            Some(crate::macros::MacroResolution::Macro(
+                crate::macros::MacroGrammar::Matches
             ))
         )
     }
@@ -1355,6 +1403,18 @@ impl<'env> Renamer<'env> {
         self.name_prim(&crate::scope::ident_name(ident))
     }
 
+    /// Whether `ident` names the primitive `isize`, or `usize` for `Some(false)`, with no
+    /// binding claiming the name.
+    pub(crate) fn pointer_sized(&self, ident: &syn::Ident) -> Option<bool> {
+        let name = crate::scope::ident_name(ident);
+        let signed = match name.as_str() {
+            "usize" => false,
+            "isize" => true,
+            _ => return None,
+        };
+        (self.prim_fallback && self.type_unclaimed(&name)).then_some(signed)
+    }
+
     /// Whether the standard prelude is active and no binding claims the trait `name`, so its
     /// associated functions resolve to the standard trait.
     pub(crate) fn prelude_trait(&self, name: &str) -> bool {
@@ -1376,6 +1436,67 @@ impl<'env> Renamer<'env> {
                 names.contains(&name.as_str())
                     && self.lookup(&[Ns::Value, Ns::Type], &name).is_none()
             })
+    }
+
+    /// Whether the standard prelude is active, no glob import may shadow a name and no binding
+    /// claims any of `names`.
+    pub(crate) fn prelude_names(&self, names: &[&str]) -> bool {
+        self.prelude
+            && !self.glob_uncertain()
+            && names
+                .iter()
+                .all(|name| self.lookup(&[Ns::Value, Ns::Type], name).is_none())
+    }
+
+    /// The origin of the binding `name` resolves to in the value namespace.
+    pub(crate) fn value_origin(&self, name: &str) -> Option<Origin> {
+        self.lookup(&[Ns::Value], name)
+            .map(|resolved| resolved.origin)
+    }
+
+    /// The variants of the enum `name` resolves to in the type namespace, when a scope in view
+    /// declares that enum.
+    pub(crate) fn enum_variants(&self, name: &str) -> Option<&[String]> {
+        let inherited: &'env [Frame] = self.inherited.frames;
+        self.frames
+            .iter()
+            .rev()
+            .chain(self.self_frame.as_ref())
+            .chain(self.generics)
+            .chain(self.seed)
+            .chain(inherited)
+            .find_map(|frame| {
+                frame
+                    .lookup(Ns::Type, name)
+                    .map(|binding| frame.variants(binding))
+            })
+            .flatten()
+    }
+
+    /// Whether `expr` names a parameter, closure input or local binding, a place that creates no
+    /// temporary.
+    pub(crate) fn names_place(&self, expr: &syn::Expr) -> bool {
+        let syn::Expr::Path(path) = expr else {
+            return false;
+        };
+        path.attrs.is_empty()
+            && path.qself.is_none()
+            && path.path.get_ident().is_some_and(|ident| {
+                matches!(
+                    self.value_origin(&crate::scope::ident_name(ident)),
+                    Some(Origin::Parameter | Origin::Let | Origin::Closure)
+                )
+            })
+    }
+
+    /// Whether the match arm readings may run: compiling source whose bindings resolve, outside
+    /// observed code and macro-reached scopes.
+    pub(crate) fn arms_allowed(&self) -> bool {
+        (self.compiles || self.analysis)
+            && !self.observed
+            && !self.tail_blocked
+            && self.macro_origins.is_none()
+            && !self.scopes.iter().any(|scope| scope.frozen)
     }
 
     /// The proven primitive type of a declared type, when the declaration
@@ -1468,6 +1589,15 @@ impl<'env> Renamer<'env> {
         })
     }
 
+    /// Whether `path` names the standard `format!` macro. Only file passes fold through the
+    /// prelude, so the file pass's shadowing proof applies.
+    pub(crate) fn standard_format(&self, path: &syn::Path) -> bool {
+        path.segments
+            .last()
+            .is_some_and(|leaf| leaf.ident == "format")
+            && self.std_format_path(path, Self::format_shadowed)
+    }
+
     fn standard_unbound(&self, name: &str) -> bool {
         let bit = crate::drift::std_name_bit(name);
         self.frames
@@ -1518,22 +1648,55 @@ impl<'env> Renamer<'env> {
         if path.segments.len() != 2 {
             return None;
         }
-        let root = if let Some(binding) = self.lookup_with_opaque(&[Ns::Type], &head, false) {
-            let Some(MacroResolution::Crate(root)) = self.standard_binding(binding) else {
-                return None;
-            };
-            root
-        } else {
-            if !self.standard_unbound(&head) {
-                return None;
-            }
-            StandardRoot::named(&head)?
-        };
+        let root = self.standard_root(&head)?;
         let name = crate::scope::ident_name(&path.segments.last()?.ident);
         if import && name == "self" {
             return Some(MacroResolution::Crate(root));
         }
         root.grammar(&name).map(MacroResolution::Macro)
+    }
+
+    /// The standard crate root `head` names, through a binding or the extern prelude.
+    fn standard_root(&self, head: &str) -> Option<crate::macros::StandardRoot> {
+        if let Some(binding) = self.lookup_with_opaque(&[Ns::Type], head, false) {
+            let Some(crate::macros::MacroResolution::Crate(root)) = self.standard_binding(binding)
+            else {
+                return None;
+            };
+            return Some(root);
+        }
+        if !self.standard_unbound(head) {
+            return None;
+        }
+        crate::macros::StandardRoot::named(head)
+    }
+
+    /// The `Flat` tag of `std::cmp::max` or `std::cmp::min`, `core` included, when `path` names
+    /// one through a standard crate root and the prelude `Ord` answers the method form.
+    pub(crate) fn standard_cmp(&self, path: &syn::Path) -> Option<char> {
+        let [root, module, name] = path.segments.iter().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        if path.leading_colon.is_some()
+            || path
+                .segments
+                .iter()
+                .any(|segment| !matches!(segment.arguments, syn::PathArguments::None))
+            || module.ident != "cmp"
+            || !self.prelude_trait("Ord")
+        {
+            return None;
+        }
+        let tag = match crate::scope::ident_name(&name.ident).as_str() {
+            "max" => '⊤',
+            "min" => '⊥',
+            _ => return None,
+        };
+        matches!(
+            self.standard_root(&crate::scope::ident_name(&root.ident))?,
+            crate::macros::StandardRoot::Std | crate::macros::StandardRoot::Core
+        )
+        .then_some(tag)
     }
 
     fn standard_binding(&self, binding: Resolved<'_>) -> Option<crate::macros::MacroResolution> {
@@ -2494,8 +2657,23 @@ impl<'env> Renamer<'env> {
         visit_fn_inputs(self, sig.inputs.iter_mut());
         syn::visit_mut::visit_return_type_mut(self, &mut sig.output);
         if let Some(body) = body {
+            if self.arms_allowed() {
+                crate::arms::normalize(self, body);
+            }
+            if self.collections_allowed() {
+                crate::collections::normalize(self, sig, body);
+            }
             self.normalize_return_body(body, sig.asyncness.is_none());
+            let returns = match &sig.output {
+                syn::ReturnType::Type(_, ty) => self.param_prim(ty),
+                syn::ReturnType::Default => None,
+            };
+            let outer = core::mem::replace(
+                &mut self.body_return,
+                returns.map(|prim| (core::ptr::from_ref::<syn::Block>(body), prim)),
+            );
             self.visit_block_mut(body);
+            self.body_return = outer;
         }
         self.pop();
         self.pop();
@@ -2689,6 +2867,7 @@ pub(crate) fn normalize_file(
 ) -> ReferenceFacts {
     let mut renamer = Renamer::seeded(options, compiles);
     renamer.clone_free &= clone_free_file(file);
+    renamer.collection_free &= collection_free_file(file);
     renamer.visit_file_mut(file);
     renamer.into_reference_facts()
 }
@@ -2698,6 +2877,7 @@ pub(crate) fn normalize_file(
 pub(crate) fn analyze_file(file: &mut syn::File, options: Options<'_>) -> ReferenceFacts {
     let mut renamer = Renamer::seeded(options, false);
     renamer.clone_free &= clone_free_file(file);
+    renamer.collection_free &= collection_free_file(file);
     renamer.analysis = true;
     renamer.visit_file_mut(file);
     renamer.into_reference_facts()
@@ -2708,6 +2888,23 @@ pub(crate) fn analyze_file(file: &mut syn::File, options: Options<'_>) -> Refere
 fn clone_free_file(file: &syn::File) -> bool {
     crate::context::standard_imports(&file.items)
         && !crate::context::declares_trait_method(&file.items, &["clone"])
+}
+
+/// The trait method names the collection readings rely on.
+pub(crate) const COLLECTION_METHODS: [&str; 6] = [
+    "iter",
+    "iter_mut",
+    "into_iter",
+    "len",
+    "is_empty",
+    "contains",
+];
+
+/// Whether a file, bodies included, imports only from the standard library and declares no
+/// trait method a collection reading relies on.
+fn collection_free_file(file: &syn::File) -> bool {
+    crate::context::standard_imports(&file.items)
+        && !crate::context::declares_trait_method(&file.items, &COLLECTION_METHODS)
 }
 
 /// True for an ident pattern that names a unit struct, variant, or
@@ -2958,6 +3155,13 @@ fn prebind(renamer: &mut Renamer<'_>, items: &[&syn::Item]) {
             Origin::Item
         };
         let binding = renamer.bind_proven(ns, &name, origin, prim);
+        if let syn::Item::Enum(item) = item {
+            renamer
+                .frames
+                .last_mut()
+                .expect("a scope frame")
+                .set_variants(&name, item);
+        }
         if let syn::Item::Struct(item) = item
             && !matches!(item.fields, syn::Fields::Named(_))
         {
@@ -3738,7 +3942,7 @@ impl VisitMut for Renamer<'_> {
                 self.compiles,
                 closure.asyncness.is_none(),
             );
-            crate::tails::unwrap(self, &mut closure.body);
+            crate::tails::unwrap(self, &mut closure.body, false);
         }
         syn::visit_mut::visit_expr_mut(self, &mut closure.body);
         self.fold_concat(&mut closure.body);
@@ -3761,7 +3965,7 @@ impl VisitMut for Renamer<'_> {
         }
         self.bind_pat(&mut arm.pat);
         if self.tails_allowed() && arm.attrs.is_empty() {
-            crate::tails::unwrap(self, &mut arm.body);
+            crate::tails::unwrap(self, &mut arm.body, self.compiles);
         }
         syn::visit_mut::visit_expr_mut(self, &mut arm.body);
         self.fold_concat(&mut arm.body);

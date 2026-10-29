@@ -366,6 +366,15 @@ pub(crate) fn signed_literal(expr: &syn::Expr) -> Option<(PrimTy, u128)> {
     {
         return None;
     }
+    closed_literal(expr)
+}
+
+/// The proven fixed-width type and value of a closed literal expression such as `2u32 * 4u32`,
+/// when it evaluates without overflow.
+pub(crate) fn closed_literal(expr: &syn::Expr) -> Option<(PrimTy, u128)> {
+    if !closed(expr, 0) {
+        return None;
+    }
     let ty = proven_type(expr, None, 0)?.fixed()?;
     let value = evaluate(expr, ty, 0)?;
     Some((
@@ -431,6 +440,99 @@ fn evaluate(expr: &syn::Expr, ty: FixedInt, depth: usize) -> Option<Integer> {
     }
 }
 
+/// The suffixed literal a byte literal, a cast of a literal or a primitive limit spells: `b'a'`
+/// reads as `97u8`, an unsuffixed integer literal cast to a proven integer type as that type's
+/// literal, which the cast gives the literal anyway, an ASCII character or byte cast to one as
+/// its code, and `u8::MAX` or `i32::MIN` as the value. A pointer-sized target takes values every
+/// pointer width holds.
+fn literal_form(renamer: &Renamer<'_>, expr: &syn::Expr) -> Option<syn::Expr> {
+    let span = expr.span();
+    match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Byte(byte),
+            ..
+        }) if byte.suffix().is_empty() => Some(literal_expr(
+            PrimTy::Int {
+                width: IntWidth::W8,
+                signed: false,
+            },
+            u128::from(byte.value()),
+            span,
+        )),
+        syn::Expr::Cast(cast) => {
+            let syn::Expr::Lit(syn::ExprLit { attrs, lit }) = &*cast.expr else {
+                return None;
+            };
+            let value = match lit {
+                syn::Lit::Int(int) if attrs.is_empty() && int.suffix().is_empty() => {
+                    int.base10_parse::<u128>().ok()?
+                }
+                syn::Lit::Char(c)
+                    if attrs.is_empty() && c.suffix().is_empty() && c.value().is_ascii() =>
+                {
+                    u128::from(u32::from(c.value()))
+                }
+                syn::Lit::Byte(byte)
+                    if attrs.is_empty() && byte.suffix().is_empty() && byte.value().is_ascii() =>
+                {
+                    u128::from(byte.value())
+                }
+                _ => return None,
+            };
+            let syn::Type::Path(path) = &*cast.ty else {
+                return None;
+            };
+            let name = path.path.get_ident().filter(|_| path.qself.is_none())?;
+            if let Some(signed) = renamer.pointer_sized(name) {
+                let limit = if signed {
+                    i16::MAX.unsigned_abs()
+                } else {
+                    u16::MAX
+                };
+                if value > u128::from(limit) {
+                    return None;
+                }
+                let suffix = if signed { "isize" } else { "usize" };
+                return Some(syn::Expr::Lit(syn::ExprLit {
+                    attrs: Vec::new(),
+                    lit: syn::Lit::Int(syn::LitInt::new(&format!("{value}{suffix}"), span)),
+                }));
+            }
+            let ty = integer_type(renamer.type_name_prim(name)?)?;
+            let model = Integer { ty, bits: 0 };
+            let value = if ty.signed {
+                model.checked_signed(i128::try_from(value).ok()?)
+            } else {
+                model.checked_unsigned(value)
+            }?;
+            Some(value.expression(span))
+        }
+        syn::Expr::Path(path) if path.qself.is_none() && path.path.leading_colon.is_none() => {
+            let mut segments = path.path.segments.iter();
+            let (Some(ty), Some(limit), None) = (segments.next(), segments.next(), segments.next())
+            else {
+                return None;
+            };
+            if !ty.arguments.is_none() || !limit.arguments.is_none() {
+                return None;
+            }
+            let prim @ PrimTy::Int { width, signed } = renamer.type_name_prim(&ty.ident)? else {
+                return None;
+            };
+            let all = u128::MAX >> (128 - width.bits());
+            let bits = if limit.ident == "MAX" {
+                if signed { all >> 1 } else { all }
+            } else if limit.ident == "MIN" {
+                if signed { 1 << (width.bits() - 1) } else { 0 }
+            } else {
+                return None;
+            };
+            Some(literal_expr(prim, bits, span))
+        }
+        _ => None,
+    }
+}
+
 /// Fold the literal arithmetic of `expr`, whose declared type is `expected` when
 /// `declared`, an unproven declared type keeping type-free folds out of its root.
 pub(crate) fn normalize_expr(
@@ -442,6 +544,7 @@ pub(crate) fn normalize_expr(
     Normalizer {
         renamer,
         expected: expected.and_then(integer_type),
+        returns: None,
         type_free: !declared,
         contextual: true,
         depth: 0,
@@ -449,20 +552,30 @@ pub(crate) fn normalize_expr(
     .visit_expr_mut(expr);
 }
 
+/// Fold the literal arithmetic of `block`. A function body whose declared return type is a
+/// proven fixed-width integer types its tail and its `return` values by it.
 pub(crate) fn normalize_block(renamer: &Renamer<'_>, block: &mut syn::Block) {
-    Normalizer {
+    let returns = renamer.body_return(block).and_then(integer_type);
+    let mut normalizer = Normalizer {
         renamer,
         expected: None,
+        returns,
         type_free: true,
         contextual: true,
         depth: 0,
+    };
+    if returns.is_some() {
+        normalizer.tail_block(block, returns);
+    } else {
+        normalizer.visit_block_mut(block);
     }
-    .visit_block_mut(block);
 }
 
 struct Normalizer<'a, 'env> {
     renamer: &'a Renamer<'env>,
     expected: Option<FixedInt>,
+    /// The type of the enclosing function's `return` values, outside closures and async blocks.
+    returns: Option<FixedInt>,
     /// Whether a closed expression here may fold to a value every integer type reads alike.
     type_free: bool,
     contextual: bool,
@@ -472,6 +585,10 @@ struct Normalizer<'a, 'env> {
 impl VisitMut for Normalizer<'_, '_> {
     fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
         if self.depth >= MAX_DEPTH || !crate::drift::expr_attrs(expr).is_empty() {
+            return;
+        }
+        if let Some(literal) = literal_form(self.renamer, expr) {
+            *expr = literal;
             return;
         }
         if closed(expr, 0) {
@@ -497,7 +614,32 @@ impl VisitMut for Normalizer<'_, '_> {
         let expected = self.expected.take();
         let type_free = core::mem::replace(&mut self.type_free, true);
         self.depth += 1;
-        visit_mut::visit_expr_mut(self, expr);
+        if let syn::Expr::If(branch) = expr
+            && expected.is_some()
+            && let Some((_, otherwise)) = &mut branch.else_branch
+        {
+            self.visit_expr_mut(&mut branch.cond);
+            self.tail_block(&mut branch.then_branch, expected);
+            self.expected = expected;
+            self.visit_expr_mut(otherwise);
+        } else if let syn::Expr::Block(block) = expr
+            && expected.is_some()
+            && block.label.is_none()
+        {
+            self.tail_block(&mut block.block, expected);
+        } else if let syn::Expr::Return(r#return) = expr
+            && let Some(value) = &mut r#return.expr
+            && self.returns.is_some()
+        {
+            self.expected = self.returns;
+            self.visit_expr_mut(value);
+        } else if matches!(expr, syn::Expr::Closure(_) | syn::Expr::Async(_)) {
+            let returns = self.returns.take();
+            visit_mut::visit_expr_mut(self, expr);
+            self.returns = returns;
+        } else {
+            visit_mut::visit_expr_mut(self, expr);
+        }
         self.depth -= 1;
         self.expected = expected;
         self.type_free = type_free;
@@ -563,6 +705,19 @@ impl VisitMut for Normalizer<'_, '_> {
     fn visit_item_mut(&mut self, _: &mut syn::Item) {}
     fn visit_macro_mut(&mut self, _: &mut syn::Macro) {}
     fn visit_attribute_mut(&mut self, _: &mut syn::Attribute) {}
+}
+
+impl Normalizer<'_, '_> {
+    /// Visit `block` with its tail expression expecting `expected`, the type of the block's
+    /// value, which an unsuffixed integer literal tail then takes.
+    fn tail_block(&mut self, block: &mut syn::Block, expected: Option<FixedInt>) {
+        self.visit_block_mut(block);
+        if let Some(syn::Stmt::Expr(tail, None)) = block.stmts.last_mut() {
+            self.expected = expected;
+            self.visit_expr_mut(tail);
+            self.expected = None;
+        }
+    }
 }
 
 /// Drop the annotation of a `let` binding one identifier whose initializer is an integer

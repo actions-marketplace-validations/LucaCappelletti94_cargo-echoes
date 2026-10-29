@@ -1071,3 +1071,397 @@ fn an_observing_impl_retains_constructor_returns() {
     };
     assert_ne!(view(&source("return Ok(());")), view(&source("Ok(())")));
 }
+
+#[test]
+fn guard_clauses_read_as_conditionals_in_the_borrowed_view() {
+    for (written, canonical) in [
+        (
+            "fn f(p: bool) { if p { return; } a(); }",
+            "fn f(p: bool) { if !p { a(); } }",
+        ),
+        (
+            "fn f(p: bool) { for _ in [0u8] { if p { continue; } a(); } }",
+            "fn f(p: bool) { for _ in [0u8] { if !p { a(); } } }",
+        ),
+        (
+            "fn f(p: bool) { loop { if p { break; } a(); } }",
+            "fn f(p: bool) { while !p { a(); } }",
+        ),
+    ] {
+        assert_eq!(view(written), view(canonical), "{written}");
+    }
+}
+
+#[test]
+fn guards_before_items_or_tails_keep_their_jump_in_the_borrowed_view() {
+    for (written, canonical) in [
+        (
+            "fn f(p: bool) { if p { return; } fn b() {} b(); }",
+            "fn f(p: bool) { if !p { fn b() {} b(); } }",
+        ),
+        (
+            "fn f(p: bool) { if p { return; } for _ in [0u8] { a(); } }",
+            "fn f(p: bool) { if !p { for _ in [0u8] { a(); } } }",
+        ),
+    ] {
+        assert_ne!(view(written), view(canonical), "{written}");
+    }
+}
+
+#[test]
+fn the_failure_mode_retains_guard_clauses() {
+    assert_ne!(
+        failing_form("fn f(p: bool) { if p { return; } a(); }"),
+        failing_form("fn f(p: bool) { if !p { a(); } }")
+    );
+    assert_ne!(
+        failing_form("fn f(p: bool) { loop { if p { break; } a(); } }"),
+        failing_form("fn f(p: bool) { while !p { a(); } }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_guard_clauses() {
+    let source = |body: &str| {
+        format!("struct S;\n#[observe]\nimpl S {{\n    fn f(p: bool) {{ {body} }}\n}}")
+    };
+    assert_ne!(
+        view(&source("if p { return; } a();")),
+        view(&source("if !p { a(); }"))
+    );
+}
+
+#[test]
+fn match_arm_readings_hold_in_the_borrowed_view() {
+    for (written, read) in [
+        (
+            "fn f(o: Option<u32>) -> u32 { if let Some(v) = o { v } else { 0 } }",
+            "fn f(o: Option<u32>) -> u32 { match o { None => 0, Some(v) => v } }",
+        ),
+        (
+            "fn f(x: u32) -> u32 { match x { 2 => 7, 0 => 1, 1 => 7, _ => 3 } }",
+            "fn f(x: u32) -> u32 { match x { 0 => 1, 1 | 2 => 7, _ => 3 } }",
+        ),
+        (
+            "enum E { A, B } fn f(e: E) -> u32 { match e { E::B => 1, E::A => 0 } }",
+            "enum E { A, B } fn f(e: E) -> u32 { match e { E::A => 0, E::B => 1 } }",
+        ),
+    ] {
+        assert_eq!(view(written), view(read), "{written}");
+    }
+}
+
+#[test]
+fn module_names_keep_arm_spellings_in_the_borrowed_view() {
+    for (written, read) in [
+        (
+            "use crate::E::A as None; enum E { A, B } fn f(o: Option<u32>) -> u32 { match o { Some(v) => v, None => 0 } }",
+            "use crate::E::A as None; enum E { A, B } fn f(o: Option<u32>) -> u32 { match o { Some(v) => v, _ => 0 } }",
+        ),
+        (
+            "mod E { pub const A: u32 = 1; pub const B: u32 = 1; } fn f(x: u32) -> u32 { match x { E::B => 1, E::A => 0, _ => 2 } }",
+            "mod E { pub const A: u32 = 1; pub const B: u32 = 1; } fn f(x: u32) -> u32 { match x { E::A => 0, E::B => 1, _ => 2 } }",
+        ),
+        (
+            "static S: Option<u32> = None; fn f() -> u32 { if let Some(v) = S { v } else { 0 } }",
+            "static S: Option<u32> = None; fn f() -> u32 { match S { Some(v) => v, _ => 0 } }",
+        ),
+    ] {
+        assert_ne!(view(written), view(read), "{written}");
+    }
+}
+
+#[test]
+fn the_failure_mode_retains_match_arm_spellings() {
+    assert_ne!(
+        failing_form("fn f(o: Option<u32>) -> u32 { if let Some(v) = o { v } else { 0 } }"),
+        failing_form("fn f(o: Option<u32>) -> u32 { match o { None => 0, Some(v) => v } }")
+    );
+    assert_ne!(
+        failing_form("fn f(x: u32) -> u32 { match x { 1 => 7, 0 => 1, _ => 3 } }"),
+        failing_form("fn f(x: u32) -> u32 { match x { 0 => 1, 1 => 7, _ => 3 } }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_match_arm_spellings() {
+    let source = |body: &str| {
+        format!("struct S;\n#[observe]\nimpl S {{\n    fn f(x: u32) -> u32 {{ {body} }}\n}}")
+    };
+    assert_ne!(
+        view(&source("match x { 1 => 7, 0 => 1, _ => 3 }")),
+        view(&source("match x { 0 => 1, 1 => 7, _ => 3 }"))
+    );
+}
+
+#[test]
+fn discarded_call_bindings_read_as_statements_in_the_borrowed_view() {
+    assert_eq!(
+        view("fn f(v: &mut Vec<u32>) { let _ = v.pop(); let _ = g(); }"),
+        view("fn f(v: &mut Vec<u32>) { v.pop(); g(); }")
+    );
+    for (bound, dropped) in [
+        (
+            "fn f(v: Vec<u32>) { let _ = v; }",
+            "fn f(v: Vec<u32>) { v; }",
+        ),
+        (
+            "fn f(v: &mut Vec<u32>) { let _last = v.pop(); }",
+            "fn f(v: &mut Vec<u32>) { v.pop(); }",
+        ),
+    ] {
+        assert_ne!(view(bound), view(dropped), "{bound}");
+    }
+}
+
+#[test]
+fn the_failure_mode_retains_discarded_call_bindings() {
+    assert_ne!(
+        failing_form("fn f(v: &mut Vec<u32>) { let _ = v.pop(); }"),
+        failing_form("fn f(v: &mut Vec<u32>) { v.pop(); }")
+    );
+}
+
+#[test]
+fn an_observing_impl_retains_discarded_call_bindings() {
+    let source = |body: &str| {
+        format!("struct S;\n#[observe]\nimpl S {{\n    fn f(v: &mut Vec<u32>) {{ {body} }}\n}}")
+    };
+    assert_ne!(view(&source("let _ = v.pop();")), view(&source("v.pop();")));
+}
+
+#[test]
+fn adjacent_literal_comparisons_read_as_strict_in_the_borrowed_view() {
+    assert_eq!(
+        view("fn f(x: u32, y: i8) -> bool { x >= 1 && y <= 5 }"),
+        view("fn f(x: u32, y: i8) -> bool { x != 0 && y < 6 }")
+    );
+    for (written, read) in [
+        (
+            "fn f(y: i8) -> bool { y > 0 }",
+            "fn f(y: i8) -> bool { y != 0 }",
+        ),
+        (
+            "fn f(z: u8) -> bool { z <= 255 }",
+            "fn f(z: u8) -> bool { z < 256 }",
+        ),
+    ] {
+        assert_ne!(view(written), view(read), "{written}");
+    }
+}
+
+#[test]
+fn the_failure_mode_retains_inclusive_comparisons() {
+    assert_ne!(
+        failing_form("fn f(x: u32) -> bool { x >= 1 }"),
+        failing_form("fn f(x: u32) -> bool { x != 0 }")
+    );
+}
+
+#[test]
+fn integer_choices_read_as_casts_and_maxima_in_the_borrowed_view() {
+    assert_eq!(
+        view("fn f(x: u32, y: u32) -> u32 { if x >= y { x } else { y } }"),
+        view("fn f(x: u32, y: u32) -> u32 { std::cmp::max(y, x) }")
+    );
+    assert_eq!(
+        view("fn f(p: bool) -> u8 { if p { 1u8 } else { 0u8 } }"),
+        view("fn f(p: bool) -> u8 { u8::from(p) }")
+    );
+    assert_ne!(
+        view("fn f(x: f32, y: f32) -> f32 { if x > y { x } else { y } }"),
+        view("fn f(x: f32, y: f32) -> f32 { x.max(y) }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_integer_choices() {
+    assert_ne!(
+        failing_form("fn f(x: u32, y: u32) -> u32 { x.max(y) }"),
+        failing_form("fn f(x: u32, y: u32) -> u32 { y.max(x) }")
+    );
+}
+
+#[test]
+fn collection_readings_hold_in_the_borrowed_view() {
+    assert_eq!(
+        view("fn f(v: &[u32]) -> bool { for x in v.iter() { g(x); } v.len() == 0 }"),
+        view("fn f(v: &[u32]) -> bool { for x in v { g(x); } v.is_empty() }")
+    );
+    assert_ne!(
+        view("trait Size { fn len(&self) -> usize; } fn f(v: &[u32]) -> bool { v.len() == 0 }"),
+        view("trait Size { fn len(&self) -> usize; } fn f(v: &[u32]) -> bool { v.is_empty() }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_collection_spellings() {
+    assert_ne!(
+        failing_form("fn f(v: &[u32]) -> bool { v.len() == 0 }"),
+        failing_form("fn f(v: &[u32]) -> bool { v.is_empty() }")
+    );
+}
+
+#[test]
+fn literal_strings_and_formatting_arguments_read_alike_in_the_borrowed_view() {
+    assert_eq!(
+        view("fn f(n: u32) -> String { println!(\"{} {}\", \"a\", n); format!(\"x\") }"),
+        view("fn f(n: u32) -> String { println!(\"a {n}\"); \"x\".to_string() }")
+    );
+    assert_eq!(
+        view("fn f() -> String { \"\".to_owned() }"),
+        view("fn f() -> String { String::new() }")
+    );
+    assert_ne!(
+        view("fn f() { println!(\"{:?}\", \"a\"); }"),
+        view("fn f() { println!(\"a\"); }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_literal_formatting_arguments() {
+    assert_ne!(
+        failing_form("fn f() { println!(\"{}\", \"a\"); }"),
+        failing_form("fn f() { println!(\"a\"); }")
+    );
+}
+
+#[test]
+fn bounds_outside_where_clauses_sort_in_the_borrowed_view() {
+    assert_eq!(
+        view("fn f(x: Box<dyn Sync + Send>, y: impl Debug + Clone) {}"),
+        view("fn f(x: Box<dyn Send + Sync>, y: impl Clone + Debug) {}")
+    );
+    assert_eq!(
+        view(
+            "struct S<'a>(&'a u8);\nimpl<'a> S<'a> {\n    fn f(&self) -> Box<dyn Sync + Send> { Box::new(*self.0) }\n}"
+        ),
+        view(
+            "struct S<'a>(&'a u8);\nimpl S<'_> {\n    fn f(&self) -> Box<dyn Send + Sync> { Box::new(*self.0) }\n}"
+        )
+    );
+    assert_ne!(
+        view("fn f(x: Box<dyn Send + Fn()>) {}"),
+        view("fn f(x: Box<dyn Fn() + Send>) {}")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_bound_order_and_impl_lifetimes() {
+    assert_ne!(
+        failing_form("fn f(x: Box<dyn Sync + Send>) {}"),
+        failing_form("fn f(x: Box<dyn Send + Sync>) {}")
+    );
+    assert_ne!(
+        failing_form("struct S<'a>(&'a u8); impl<'a> S<'a> {}"),
+        failing_form("struct S<'a>(&'a u8); impl S<'_> {}")
+    );
+}
+
+#[test]
+fn literal_casts_limits_and_power_of_two_arithmetic_read_alike_in_the_borrowed_view() {
+    for (written, canonical) in [
+        ("fn f() -> u64 { 5 as u64 }", "fn f() -> u64 { 5u64 }"),
+        ("fn f() -> u8 { u8::MAX }", "fn f() -> u8 { 255u8 }"),
+        ("fn f() -> u8 { b'a' }", "fn f() -> u8 { 97u8 }"),
+        (
+            "fn f(x: u32) -> u32 { x / 8 }",
+            "fn f(x: u32) -> u32 { x >> 3 }",
+        ),
+        (
+            "fn f(x: i32) -> bool { x % 2 == 0 }",
+            "fn f(x: i32) -> bool { x & 1 == 0 }",
+        ),
+    ] {
+        assert_eq!(view(written), view(canonical), "{written}");
+    }
+    assert_ne!(
+        view("fn f(x: i32) -> i32 { x / 2 }"),
+        view("fn f(x: i32) -> i32 { x >> 1 }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_literal_casts_and_power_of_two_arithmetic() {
+    assert_ne!(
+        failing_form("fn f() -> u64 { 5 as u64 }"),
+        failing_form("fn f() -> u64 { 5u64 }")
+    );
+    assert_ne!(
+        failing_form("fn f(x: u32) -> u32 { x / 8 }"),
+        failing_form("fn f(x: u32) -> u32 { x >> 3 }")
+    );
+}
+
+#[test]
+fn literal_disjunctions_read_as_one_chain_in_the_borrowed_view() {
+    for (written, canonical) in [
+        (
+            "fn f(x: u32) -> bool { matches!(x, 2 | 1) }",
+            "fn f(x: u32) -> bool { x == 1 || x == 2 }",
+        ),
+        (
+            "fn f(x: u8) -> bool { (1..=5).contains(&x) }",
+            "fn f(x: u8) -> bool { x >= 1 && x <= 5 }",
+        ),
+    ] {
+        assert_eq!(view(written), view(canonical), "{written}");
+    }
+    assert_ne!(
+        view("fn f(x: u32) -> bool { matches!(x, 1 | 2 if x > 1) }"),
+        view("fn f(x: u32) -> bool { x == 1 || x == 2 }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_literal_disjunction_spellings() {
+    assert_ne!(
+        failing_form("fn f(x: u32) -> bool { matches!(x, 1 | 2) }"),
+        failing_form("fn f(x: u32) -> bool { x == 1 || x == 2 }")
+    );
+}
+
+#[test]
+fn return_types_type_literal_tails_in_the_borrowed_view() {
+    for (written, canonical) in [
+        ("fn f() -> u32 { 2 + 3 }", "fn f() -> u32 { 5u32 }"),
+        (
+            "fn f(p: bool) -> u8 { if p { return 7; } 9 }",
+            "fn f(p: bool) -> u8 { if p { return 7u8; } 9u8 }",
+        ),
+    ] {
+        assert_eq!(view(written), view(canonical), "{written}");
+    }
+    assert_ne!(
+        view("fn f() -> impl Copy { 5 }"),
+        view("fn f() -> impl Copy { 5u32 }")
+    );
+}
+
+#[test]
+fn the_failure_mode_retains_untyped_literal_tails() {
+    assert_ne!(
+        failing_form("fn f() -> u32 { 5 }"),
+        failing_form("fn f() -> u32 { 5u32 }")
+    );
+}
+
+#[test]
+fn a_returned_value_built_from_closed_literal_arithmetic_reads_as_its_tail() {
+    let original = "fn f(red: u32, green: u32, blue: u32, alpha: u32, opaque: bool) -> u32 {
+        let rgb = ((red & 0xffu32) << 16u32) | ((green & 0xffu32) << 8u32) | (blue & 0xffu32);
+        let a = if opaque { 0xffu32 } else { alpha & 0xffu32 };
+        let visible = if a == 0u32 { 0u32 } else { rgb };
+        (a << 24u32) | visible
+    }";
+    let rewritten = "fn f(x: u32, y: u32, z: u32, w: u32, solid: bool) -> u32 {
+        let unused = 17u32;
+        let lo = 255u32 & z;
+        let mid = (y & 255u32) << (2u32 * 4u32);
+        let packed = lo | mid | (x & 0xffu32) << 16u32;
+        let top = if !solid { w & 255u32 } else { 255u32 };
+        let shown = if top == 0u32 { 0u32 } else { packed };
+        return top << 24u32 | shown;
+    }";
+    assert_eq!(view(original), view(rewritten));
+}

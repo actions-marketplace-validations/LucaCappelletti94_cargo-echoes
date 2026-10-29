@@ -198,6 +198,55 @@ pub mod alpha {
         if value == 0 { return None; }
         Some(value)
     }
+    pub fn skipped(values: &[u32], quiet: bool) {
+        if quiet { return; }
+        for value in values { if *value == 0 { continue; } epsilon(*value); }
+        epsilon(0u32);
+    }
+    pub fn ranked(value: Option<u32>, digit: u8) -> u32 {
+        let first = if let Some(found) = value { found } else { 0 };
+        match digit { 2 => first, 0 => 1, 1 => first, _ => 9 }
+    }
+    pub fn trimmed(values: &mut Vec<u32>) {
+        let _ = values.pop();
+    }
+    pub fn bounded(value: u32) -> bool {
+        value >= 1 && value <= 9
+    }
+    pub fn chosen(value: u32, other: u32, flag: bool) -> u32 {
+        let bit: u32 = if flag { 1 } else { 0 };
+        bit + std::cmp::max(value, other)
+    }
+    pub fn summed(values: &[u32]) -> u32 {
+        let mut sum = 0;
+        for value in values.iter() { sum += value; }
+        if values.len() == 0 { 1 } else { sum }
+    }
+    pub fn worded(value: u32) -> String {
+        println!("{} {}", "value", value);
+        if value == 0 { String::from("") } else { format!("set") }
+    }
+    pub fn boxed(value: u32) -> Box<dyn core::fmt::Debug + Send + Sync> {
+        Box::new(value)
+    }
+    pub struct Held<'a>(pub &'a u32);
+    impl<'a> Held<'a> {
+        pub fn get(&self) -> u32 { *self.0 }
+    }
+    pub fn bucket(id: u32) -> u32 {
+        (id / 16 % 8) as u32 + (b'a' as u32) - u8::MAX as u32
+    }
+    pub fn small(value: u32) -> bool {
+        matches!(value, 1 | 3..=5) || (7..=9).contains(&value)
+    }
+    pub fn coded(flag: bool) -> u8 {
+        if flag { return 2 + 3; }
+        if flag { 1 } else { 0 }
+    }
+    pub fn shifted(value: u32) -> u32 {
+        let width = 2u32 * 4u32;
+        return value << width;
+    }
 }
 mod custom {
     macro_rules! vec {
