@@ -556,3 +556,55 @@ jobs:
         with:
           name: return-literal-typing-witnesses
           path: ${{ runner.temp }}/return-literal-typing-witnesses.json
+      - name: Verify import path witnesses
+        id: import_paths_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/import_paths_cases.json
+          --request-id "DG-CI-IMPORTS-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/import-paths-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.import_paths_witnesses.outcome != 'skipped'
+        with:
+          name: import-paths-witnesses
+          path: ${{ runner.temp }}/import-paths-witnesses.json
+      - name: Verify ref binding witnesses
+        id: ref_bindings_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/ref_bindings_cases.json
+          --request-id "DG-CI-REFS-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/ref-bindings-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.ref_bindings_witnesses.outcome != 'skipped'
+        with:
+          name: ref-bindings-witnesses
+          path: ${{ runner.temp }}/ref-bindings-witnesses.json
+      - name: Verify let-and-return witnesses
+        id: let_return_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/let_return_cases.json
+          --request-id "DG-CI-LETRET-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/let-return-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.let_return_witnesses.outcome != 'skipped'
+        with:
+          name: let-return-witnesses
+          path: ${{ runner.temp }}/let-return-witnesses.json
+      - name: Verify matches expansion witnesses
+        id: matches_expansion_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/matches_expansion_cases.json
+          --request-id "DG-CI-MATCHES-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/matches-expansion-witnesses.json"
+          --timeout 600
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.matches_expansion_witnesses.outcome != 'skipped'
+        with:
+          name: matches-expansion-witnesses
+          path: ${{ runner.temp }}/matches-expansion-witnesses.json

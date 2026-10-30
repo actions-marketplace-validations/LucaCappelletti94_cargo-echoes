@@ -1964,6 +1964,161 @@ fn literal_tail_functions_group_by_their_return_type() {
     assert_eq!(function_groups(&scan(2)).len(), 0);
 }
 
+const IMPORTS_FIXTURE: &str = "tests/fixtures/importsws";
+
+#[test]
+fn imported_and_rooted_standard_paths_group_together() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(IMPORTS_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec![
+        "importsws::imported",
+        "importsws::module",
+        "importsws::rooted",
+    ]];
+    for tokens in [0, 23] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(24)).len(), 0);
+}
+
+#[test]
+fn edition_2015_imports_keep_their_spelling() {
+    let report = Echoes::default()
+        .functions()
+        .fn_min_tokens(0)
+        .run("tests/fixtures/imports2015ws")
+        .unwrap();
+    assert_eq!(report.functions, 4);
+    assert_eq!(function_groups(&report).len(), 0);
+}
+
+const REF_BINDINGS_FIXTURE: &str = "tests/fixtures/refbindingsws";
+
+#[test]
+fn ref_binding_doctests_group_with_their_borrowed_spelling() {
+    let report = Echoes::default().run(REF_BINDINGS_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["refbindingsws::Ergonomic", "refbindingsws::Explicit"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(40)
+        .run(REF_BINDINGS_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(41)
+        .run(REF_BINDINGS_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn ref_binding_functions_group_apart_from_moves() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(REF_BINDINGS_FIXTURE)
+            .unwrap()
+    };
+    let both = [
+        vec![
+            "refbindingsws::Config::ergonomic",
+            "refbindingsws::Config::explicit",
+        ],
+        vec!["refbindingsws::borrowed", "refbindingsws::label"],
+    ];
+    for tokens in [0, 10] {
+        assert_eq!(function_groups(&scan(tokens)), both);
+    }
+    assert_eq!(function_groups(&scan(11)), both[..1]);
+    assert_eq!(function_groups(&scan(15)).len(), 0);
+}
+
+const LET_RETURN_FIXTURE: &str = "tests/fixtures/letreturnws";
+
+#[test]
+fn let_and_return_doctests_group_with_their_direct_tail() {
+    let report = Echoes::default().run(LET_RETURN_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["letreturnws::Bound", "letreturnws::Direct"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(26)
+        .run(LET_RETURN_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(27)
+        .run(LET_RETURN_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn let_and_return_functions_group_with_their_direct_tail() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(LET_RETURN_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec![
+        "letreturnws::direct",
+        "letreturnws::returned",
+        "letreturnws::scaled",
+    ]];
+    for tokens in [0, 5] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(6)).len(), 0);
+}
+
+const MATCHES_FIXTURE: &str = "tests/fixtures/matchesws";
+
+#[test]
+fn matches_doctests_group_with_their_written_match() {
+    let report = Echoes::default().run(MATCHES_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["matchesws::Macro", "matchesws::Written"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(59)
+        .run(MATCHES_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(60)
+        .run(MATCHES_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn negated_matches_functions_group_with_their_swapped_match() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(MATCHES_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["matchesws::absent", "matchesws::empty"]];
+    for tokens in [0, 9] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(10)).len(), 0);
+}
+
 const CONTEXT_FIXTURE: &str = "tests/fixtures/contextws";
 
 fn context_scan() -> Report {

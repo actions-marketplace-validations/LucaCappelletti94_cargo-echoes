@@ -247,6 +247,19 @@ pub mod alpha {
         let width = 2u32 * 4u32;
         return value << width;
     }
+    pub fn named(name: Option<String>) -> usize {
+        match name {
+            Some(ref text) => text.len(),
+            None => 0,
+        }
+    }
+    pub fn bound(value: u32) -> u32 {
+        let scaled = value * 3u32;
+        scaled
+    }
+    pub fn present(value: Option<u32>) -> bool {
+        !matches!(value, Some(_))
+    }
 }
 mod custom {
     macro_rules! vec {

@@ -140,6 +140,14 @@ Equal forms mean approximate duplication, since the normalization cannot see wha
 
 Macro input retains significant commas unless lexical resolution proves a supported standard grammar. Enclosing macros and live attributes preserve comma spelling.
 
+A function view from `SourceContext` under Rust 2018 or later reads a file-level import of an external crate item as the item's rooted path wherever the import is in view, so `use std::mem;` then `mem::swap` matches `std::mem::swap`. The module must declare and import no other item of the crate's name. Whole-file keys, imports inside function bodies, observed functions and Rust 2015 keep the written spelling.
+
+In compiling mode, a `match`, `if let`, `while let` or `let` over a place whose patterns bind only by `ref`, or only by `ref mut`, reads as the same patterns without `ref` over a borrow of the place, so `match o { Some(ref s) => … }` matches `match &o { Some(s) => … }`. A parameter declared as a shared reference reads `*r` as `r` there. A by-value binding, a reference pattern or a plain name that resolution cannot prove a constant keeps the written form.
+
+In compiling mode, `let y = e; y` and `let y = e; return y;` at the end of a tail block read as `e` when `y` is a plain binding without annotation and `e` passes the temporary-free value proof of tail returns, a built-in `concat!` of string literals included.
+
+In compiling mode, a standard `matches!(e, P)` reads as `match e { P => true, _ => false }`, with a guard kept, and `!match e { … }` whose every arm yields a `bool` literal reads with each literal negated. A body that declares its own `matches!` macro keeps the call.
+
 ## Stability
 
 `CanonicalForm` keys and hashes are comparable within a semver-compatible release series. Before `1.0`, each minor version defines a series, such as `0.5.x`. Incompatible normalization requires a new series.
