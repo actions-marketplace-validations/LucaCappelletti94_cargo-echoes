@@ -275,6 +275,29 @@ pub mod alpha {
     pub fn digit(c: char) -> bool {
         c.is_ascii_digit()
     }
+    pub fn widened(value: u16) -> u32 {
+        value.into()
+    }
+    pub fn listed() -> usize {
+        let items: Vec<u32> = Vec::new();
+        items.len()
+    }
+    pub fn drained(items: &mut Vec<u32>) -> u32 {
+        let mut total = 0u32;
+        loop {
+            match items.pop() {
+                Some(item) => total ^= item,
+                None => break,
+            }
+        }
+        total
+    }
+    pub fn shown(total: u32) -> String {
+        format!("{0}/{0}", total)
+    }
+    pub fn present(values: &[u32], wanted: u32) -> bool {
+        values.iter().any(|value| *value == wanted)
+    }
 }
 mod custom {
     macro_rules! vec {

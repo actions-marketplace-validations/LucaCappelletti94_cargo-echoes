@@ -673,3 +673,68 @@ jobs:
         with:
           name: char-primitive-witnesses
           path: ${{ runner.temp }}/char-primitive-witnesses.json
+      - name: Verify declared conversion witnesses
+        id: declared_conversions_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/declared_conversions_cases.json
+          --request-id "DG-CI-CONVERSIONS-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/declared-conversions-witnesses.json"
+          --timeout 900
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.declared_conversions_witnesses.outcome != 'skipped'
+        with:
+          name: declared-conversions-witnesses
+          path: ${{ runner.temp }}/declared-conversions-witnesses.json
+      - name: Verify constructor annotation witnesses
+        id: constructor_annotations_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/constructor_annotations_cases.json
+          --request-id "DG-CI-ANNOTATIONS-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/constructor-annotations-witnesses.json"
+          --timeout 900
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.constructor_annotations_witnesses.outcome != 'skipped'
+        with:
+          name: constructor-annotations-witnesses
+          path: ${{ runner.temp }}/constructor-annotations-witnesses.json
+      - name: Verify loop and while let witnesses
+        id: loop_while_let_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/loop_while_let_cases.json
+          --request-id "DG-CI-LOOPS-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/loop-while-let-witnesses.json"
+          --timeout 900
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.loop_while_let_witnesses.outcome != 'skipped'
+        with:
+          name: loop-while-let-witnesses
+          path: ${{ runner.temp }}/loop-while-let-witnesses.json
+      - name: Verify formatting macro witnesses
+        id: format_spellings_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/format_spellings_cases.json
+          --request-id "DG-CI-FORMATS-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/format-spellings-witnesses.json"
+          --timeout 900
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.format_spellings_witnesses.outcome != 'skipped'
+        with:
+          name: format-spellings-witnesses
+          path: ${{ runner.temp }}/format-spellings-witnesses.json
+      - name: Verify iterator chain witnesses
+        id: iterator_chains_witnesses
+        run: >-
+          python3 -B tests/dependency_constants_witnesses.py
+          --cases tests/fixtures/dependency/iterator_chains_cases.json
+          --request-id "DG-CI-CHAINS-${{ github.run_id }}-${{ github.run_attempt }}"
+          --output "${{ runner.temp }}/iterator-chains-witnesses.json"
+          --timeout 900
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.iterator_chains_witnesses.outcome != 'skipped'
+        with:
+          name: iterator-chains-witnesses
+          path: ${{ runner.temp }}/iterator-chains-witnesses.json

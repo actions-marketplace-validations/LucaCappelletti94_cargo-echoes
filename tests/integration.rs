@@ -2298,6 +2298,185 @@ fn strict_char_bounds_group_with_their_adjacent_inclusive_bound() {
     assert_eq!(function_groups(&scan(4)).len(), 0);
 }
 
+const CONVERSIONS_FIXTURE: &str = "tests/fixtures/conversionsws";
+
+#[test]
+fn into_doctests_group_with_their_from_spelling() {
+    let report = Echoes::default().run(CONVERSIONS_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["conversionsws::From", "conversionsws::Into"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(20)
+        .run(CONVERSIONS_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(21)
+        .run(CONVERSIONS_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn default_replacements_group_with_take() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(CONVERSIONS_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["conversionsws::drained", "conversionsws::taken"]];
+    for tokens in [0, 2] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(3)).len(), 0);
+}
+
+const ANNOTATIONS_FIXTURE: &str = "tests/fixtures/annotationsws";
+
+#[test]
+fn annotated_constructor_doctests_group_with_their_turbofish() {
+    let report = Echoes::default().run(ANNOTATIONS_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["annotationsws::Annotated", "annotationsws::Turbofish"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(28)
+        .run(ANNOTATIONS_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(29)
+        .run(ANNOTATIONS_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn imported_map_annotations_group_with_their_turbofish() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(ANNOTATIONS_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["annotationsws::counts", "annotationsws::tallies"]];
+    for tokens in [0, 30] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(31)).len(), 0);
+}
+
+const LOOPS_FIXTURE: &str = "tests/fixtures/loopsws";
+
+#[test]
+fn breaking_match_doctests_group_with_their_while_let() {
+    let report = Echoes::default().run(LOOPS_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["loopsws::Looped", "loopsws::WhileLet"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default().min_tokens(33).run(LOOPS_FIXTURE).unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default().min_tokens(34).run(LOOPS_FIXTURE).unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn breaking_match_functions_group_with_their_while_let() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(LOOPS_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["loopsws::drain", "loopsws::pop_all"]];
+    for tokens in [0, 17] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(18)).len(), 0);
+}
+
+const FORMATS_FIXTURE: &str = "tests/fixtures/formatsws";
+
+#[test]
+fn trailing_newline_doctests_group_with_their_line_macro() {
+    let report = Echoes::default().run(FORMATS_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["formatsws::Line", "formatsws::Printed"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(11)
+        .run(FORMATS_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(12)
+        .run(FORMATS_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn indexed_format_functions_group_with_their_inline_arguments() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(FORMATS_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["formatsws::inline", "formatsws::labelled"]];
+    for tokens in [0, 3] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(4)).len(), 0);
+}
+
+const CHAINS_FIXTURE: &str = "tests/fixtures/chainsws";
+
+#[test]
+fn mapped_copy_doctests_group_with_their_copied_turbofish() {
+    let report = Echoes::default().run(CHAINS_FIXTURE).unwrap();
+    assert_eq!(report.total, 3);
+    assert_eq!(report.unique, 2);
+    let expected = [vec!["chainsws::Copied", "chainsws::Mapped"]];
+    assert_eq!(doctest_groups(&report), expected);
+    let kept = Echoes::default()
+        .min_tokens(47)
+        .run(CHAINS_FIXTURE)
+        .unwrap();
+    assert_eq!(doctest_groups(&kept), expected);
+    let dropped = Echoes::default()
+        .min_tokens(48)
+        .run(CHAINS_FIXTURE)
+        .unwrap();
+    assert_eq!(dropped.groups.len(), 0);
+}
+
+#[test]
+fn negated_any_functions_group_with_their_all() {
+    let scan = |tokens| {
+        Echoes::default()
+            .functions()
+            .fn_min_tokens(tokens)
+            .run(CHAINS_FIXTURE)
+            .unwrap()
+    };
+    let expected = [vec!["chainsws::quiet", "chainsws::small"]];
+    for tokens in [0, 13] {
+        assert_eq!(function_groups(&scan(tokens)), expected);
+    }
+    assert_eq!(function_groups(&scan(14)).len(), 0);
+}
+
 const CONTEXT_FIXTURE: &str = "tests/fixtures/contextws";
 
 fn context_scan() -> Report {

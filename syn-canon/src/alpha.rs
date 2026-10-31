@@ -1323,8 +1323,9 @@ impl<'env> Renamer<'env> {
         self.prelude && self.clone_free
     }
 
-    /// Whether the standard collection methods `iter`, `iter_mut`, `into_iter`, `len`,
-    /// `is_empty` and `as_str`, and the inherent `contains` of the standard ranges, answer their
+    /// Whether the standard collection methods `iter`, `iter_mut`, `into_iter`, `chars`,
+    /// `bytes`, `lines`, `len`, `is_empty` and `as_str`, and the inherent `contains` of the
+    /// standard slices and ranges, answer their
     /// calls: the standard prelude is active, every import in view comes from the standard
     /// library and no trait in view declares one of those names.
     pub(crate) fn collection_free(&self) -> bool {
@@ -1793,6 +1794,67 @@ impl<'env> Renamer<'env> {
             crate::macros::StandardRoot::Std | crate::macros::StandardRoot::Core
         )
         .then_some(tag)
+    }
+
+    /// The standard collection the type path `path` names, the arguments of its last segment
+    /// aside: `Vec` and `String` through the prelude, `Vec`, `String`, `VecDeque`, `BTreeMap`,
+    /// `BTreeSet`, `HashMap` and `HashSet` through an import of their standard path, or any of
+    /// them by that path.
+    pub(crate) fn standard_collection(&self, path: &syn::Path) -> Option<&'static str> {
+        let segments = path.segments.iter().collect::<Vec<_>>();
+        let (last, modules) = segments.split_last()?;
+        if modules.iter().any(|segment| !segment.arguments.is_none())
+            || path.leading_colon.is_some() && modules.is_empty()
+        {
+            return None;
+        }
+        let name = crate::scope::ident_name(&last.ident);
+        let collection = *STANDARD_COLLECTIONS
+            .iter()
+            .find(|collection| **collection == name)?;
+        let [head, rest @ ..] = modules else {
+            let Some(binding) = self.lookup_with_opaque(&[Ns::Type], collection, false) else {
+                return (matches!(collection, "Vec" | "String")
+                    && self.prelude
+                    && self.standard_unbound(collection))
+                .then_some(collection);
+            };
+            let target: Vec<&str> = match (binding.external, binding.target) {
+                (Some(external), _) => external.iter().map(String::as_str).collect(),
+                (None, Some(index)) => {
+                    let target = self.target_of(binding.domain, index);
+                    if target
+                        .segments
+                        .iter()
+                        .any(|segment| segment.origin.is_some())
+                    {
+                        return None;
+                    }
+                    target
+                        .segments
+                        .iter()
+                        .map(|segment| segment.name.as_str())
+                        .collect()
+                }
+                (None, None) => return None,
+            };
+            let (root, module) = target.split_first()?;
+            let root = crate::macros::StandardRoot::named(root)?;
+            return standard_collection_path(root, module, collection).then_some(collection);
+        };
+        let head = crate::scope::ident_name(&head.ident);
+        let root = if path.leading_colon.is_some() {
+            crate::macros::StandardRoot::named(&head)?
+        } else {
+            self.standard_root(&head)?
+        };
+        let module: Vec<String> = rest
+            .iter()
+            .map(|segment| crate::scope::ident_name(&segment.ident))
+            .chain(core::iter::once(name))
+            .collect();
+        let module: Vec<&str> = module.iter().map(String::as_str).collect();
+        standard_collection_path(root, &module, collection).then_some(collection)
     }
 
     fn standard_binding(&self, binding: Resolved<'_>) -> Option<crate::macros::MacroResolution> {
@@ -2798,6 +2860,7 @@ impl<'env> Renamer<'env> {
         syn::visit_mut::visit_return_type_mut(self, &mut sig.output);
         if let Some(body) = body {
             if self.arms_allowed() {
+                crate::conversions::normalize(self, sig, body);
                 crate::options::normalize(self, sig, body);
                 crate::arms::normalize(self, sig, body);
             }
@@ -3038,10 +3101,13 @@ fn clone_free_file(file: &syn::File) -> bool {
 }
 
 /// The trait method names the collection readings rely on.
-pub(crate) const COLLECTION_METHODS: [&str; 7] = [
+pub(crate) const COLLECTION_METHODS: [&str; 10] = [
     "iter",
     "iter_mut",
     "into_iter",
+    "chars",
+    "bytes",
+    "lines",
     "len",
     "is_empty",
     "contains",
@@ -3113,6 +3179,43 @@ pub(crate) const ASCII_METHODS: [&str; 7] = [
 fn ascii_free_file(file: &syn::File) -> bool {
     crate::context::standard_imports(&file.items)
         && !crate::context::declares_trait_method(&file.items, &ASCII_METHODS)
+}
+
+/// The standard collections the constructor annotation reading moves type arguments onto.
+const STANDARD_COLLECTIONS: [&str; 7] = [
+    "Vec", "String", "VecDeque", "BTreeMap", "BTreeSet", "HashMap", "HashSet",
+];
+
+/// Whether `path`, below the standard crate `root`, names the standard `collection`: its own
+/// module's item, and for the `collections` types also their re-export from `collections`.
+fn standard_collection_path(
+    root: crate::macros::StandardRoot,
+    path: &[&str],
+    collection: &str,
+) -> bool {
+    use crate::macros::StandardRoot;
+    let (module, reexported) = match collection {
+        "Vec" => ("vec", false),
+        "String" => ("string", false),
+        "VecDeque" => ("vec_deque", true),
+        "BTreeMap" => ("btree_map", true),
+        "BTreeSet" => ("btree_set", true),
+        "HashMap" => ("hash_map", true),
+        _ => ("hash_set", true),
+    };
+    let hashed = matches!(collection, "HashMap" | "HashSet");
+    let rooted = match root {
+        StandardRoot::Std => true,
+        StandardRoot::Alloc => !hashed,
+        StandardRoot::Core => false,
+    };
+    rooted
+        && match path {
+            [owner, name] if reexported => *owner == "collections" && *name == collection,
+            [owner, name] => *owner == module && *name == collection,
+            ["collections", owner, name] if reexported => *owner == module && *name == collection,
+            _ => false,
+        }
 }
 
 /// True for an ident pattern that names a unit struct, variant, or
